@@ -89,9 +89,22 @@ In any Hermes chat session:
 
 ```text
 /frihet status    # local snapshot — no network
-/frihet setup     # validate FRIHET_API_KEY and print the MCP server block
-/frihet doctor    # live MCP handshake — checks endpoint and auth
+/frihet setup     # validate FRIHET_API_KEY (or a candidate you paste once)
+/frihet doctor    # live MCP handshake — reports four explicit states
 ```
+
+`/frihet doctor` reports four booleans side by side rather than a single
+`connected` flag, because those four states are NOT the same thing:
+
+| State | Means |
+|-------|-------|
+| `endpoint_reachable` | The network handshake landed on a server (HTTP 2xx/4xx/5xx). |
+| `mcp_configured_in_hermes` | A credential is wired into `mcp_servers.frihet` (Bearer key or completed OAuth). |
+| `authenticated` | The server returned 200 + valid MCP handshake with our credential. |
+| `tools_available` | The `initialize` response carries a populated `serverInfo` and parses as MCP. |
+
+An anonymous HTTP 200 is reachable but NOT authenticated. The umbrella
+`ok` only flips true when all four states are true.
 
 Then ask Hermes:
 
@@ -164,7 +177,10 @@ hermes plugins validate ~/.hermes/plugins/frihet --install-deps
 ## Compatibility
 
 - **Hermes Agent:** `>=0.21.5` (declared in `plugin.yaml` as `requires_hermes`).
-- **Python:** `>=3.11` (matches Hermes Agent's floor).
+- **Python:** Hermes Agent currently `we *only* support 3.14` per its
+  `pyproject.toml` (the `>=3.11,<3.15` range is only so older installs can
+  run the updater and reach 3.14). CI runs the authoritative job on 3.14
+  and a non-blocking smoke on 3.11/3.12/3.13.
 - **Frihet MCP protocol:** `2025-06-18` (forward-compatible with later minor).
 
 ## Upstream MCP catalog candidate
