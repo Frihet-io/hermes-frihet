@@ -78,7 +78,12 @@ def _command(raw_args: str) -> str:
             "subcommands": {
                 "status": "Show local plugin config (no network).",
                 "setup": "Validate FRIHET_API_KEY and print the MCP server block.",
-                "doctor": "Live MCP handshake — checks endpoint and auth.",
+                "doctor": (
+                    "Live MCP probe — reports endpoint_reachable, "
+                    "mcp_configured_in_hermes, authenticated, and "
+                    "tools_available as separate booleans (NOT a single "
+                    "connected flag)."
+                ),
             },
         }
     else:
