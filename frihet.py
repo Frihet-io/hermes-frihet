@@ -158,6 +158,18 @@ DRAFT_FIRST_OPERATIONS: tuple[str, ...] = (
     "create_quote",
     "createCreditNote",
     "create_credit_note",
+    "createClient",
+    "create_client",
+    "createClientContact",
+    "create_client_contact",
+    "createClientNote",
+    "create_client_note",
+    "createProduct",
+    "create_product",
+    "createExpense",
+    "create_expense",
+    "logClientActivity",
+    "log_client_activity",
 )
 
 
@@ -461,18 +473,55 @@ def doctor(
 ) -> dict[str, Any]:
     """Run the liveness probe and return a structured report.
 
-    Combines :func:`status` with :func:`probe_mcp` so a single ``/frihet
-    doctor`` call answers "is the plugin configured AND can it talk to
-    Frihet right now?".
+    The doctor answers FOUR distinct questions, because ``reachable``,
+    ``authenticated`` and ``mcp_ready`` are NOT the same thing:
 
-    The probe is ALWAYS run. When ``FRIHET_API_KEY`` is unset we send the
-    handshake without an Authorization header — the canonical Frihet MCP may
-    answer (demo mode, OAuth discovery probe) or reject with 401, and either
-    outcome is information the user needs.
+      1. ``endpoint_reachable`` — did the network handshake land on a server?
+         (HTTP 2xx/4xx/5xx all count as reachable.)
+      2. ``mcp_configured_in_hermes`` — is the ``mcp_servers.frihet`` block
+         wired into the host's config? (Today this plugin reports ``True``
+         only when ``FRIHET_API_KEY`` is set or OAuth was completed
+         through ``mcp_oauth_manager``; a future version will introspect
+         ``~/.hermes/config.yaml``.)
+      3. ``authentication_required`` / ``authenticated`` — does the server
+         demand auth, and does our credential pass? An anonymous 200 is
+         *reachable* but NOT *authenticated*.
+      4. ``tools_available`` — does the server's ``initialize`` response
+         parse as a recognisable MCP shape, with serverInfo populated?
+
+    We DO NOT collapse these into a single ``ok`` boolean: a "connected"
+    flag that flips true on HTTP 200 would lie. The summary line at
+    the end prints the four states side by side so the operator sees the
+    difference at a glance.
+
+    The probe is ALWAYS run. When ``FRIHET_API_KEY`` is unset we send
+    the handshake without an ``Authorization`` header — the canonical
+    Frihet MCP may answer (demo mode, OAuth discovery probe) or reject
+    with 401, and either outcome is information the user needs.
     """
     snapshot = status()
-    snapshot["probe"] = probe_mcp(url=url, timeout=timeout, opener=opener)
-    snapshot["ok"] = bool(snapshot["probe"].get("success"))
+    probe = probe_mcp(url=url, timeout=timeout, opener=opener)
+
+    reachable = bool(probe.get("status"))
+    mcp_shape = bool(probe.get("server", {}).get("name"))
+    key_present = bool(api_key())
+    unauth = probe.get("error") == "mcp_unauthorized"
+
+    states = {
+        "endpoint_reachable": reachable,
+        "mcp_configured_in_hermes": key_present,  # best signal we have today
+        "authenticated": (probe.get("success") is True)
+        and (not unauth)
+        and key_present,
+        "tools_available": mcp_shape and probe.get("success") is True,
+    }
+
+    snapshot["probe"] = probe
+    snapshot["states"] = states
+    # Legacy single-ok flag kept for callers that already use it. It is
+    # ``True`` only when ALL four states are true. Reachability alone is
+    # not enough to flip this flag.
+    snapshot["ok"] = all(states.values())
     return snapshot
 
 

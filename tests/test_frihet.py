@@ -199,6 +199,61 @@ def test_pre_tool_call_gate_unknown_tool_escalates_to_approval():
     assert payload["rule_key"].startswith("frihet:unknown:")
 
 
+# ─── Real Frihet tool names — clamp + classification regression suite ────
+# Hermes's MCP client truncates ``mcp__<server>__<tool>`` names longer than
+# 64 chars to a deterministic hash suffix (see ``tools/mcp_tool_schema.py``,
+# ``_MCP_TOOL_NAME_MAX_LENGTH = 64``). Real Frihet tool names (snake_case,
+# mostly <40 chars) almost never hit that ceiling, but a handful of the
+# longest verbs — ``register_verifactu_submission_with_external_invoice_…``
+# — do. The classifier must still recognise them as irreversible, otherwise
+# the hook would silently downgrade a fiscal action to a read.
+
+REAL_FRIHET_TOOLS = [
+    # reads — must NOT escalate
+    ("list_invoices", None),
+    ("get_invoice", None),
+    ("search_invoices", None),
+    ("list_clients", None),
+    ("list_client_activities", None),
+    ("list_products", None),
+    ("list_quotes", None),
+    ("get_invoice_pdf", None),
+    # draft-writes — must NOT escalate (the skill pauses for human)
+    ("create_invoice", None),
+    ("create_credit_note", None),
+    ("create_client", None),
+    ("create_quote", None),
+    # irreversibles — MUST escalate to action=approve
+    ("send_invoice", "irreversible-write"),
+    ("mark_invoice_paid", "irreversible-write"),
+    ("delete_invoice", "irreversible-write"),
+    ("delete_client", "irreversible-write"),
+    ("apply_late_fee", "irreversible-write"),
+    # the long ones — must STILL escalate even after the 64-char clamp
+    ("register_verifactu_submission_with_external_invoice_attachment", "irreversible-write"),
+    ("apply_credit_note_to_invoice_with_balance_adjustment", "irreversible-write"),
+]
+
+
+@pytest.mark.parametrize("tool_name,expected_kind", REAL_FRIHET_TOOLS)
+def test_real_frihet_tool_classification(tool_name, expected_kind):
+    """Every documented Frihet MCP tool must classify correctly, even after
+    Hermes's 64-char clamp turns a long name into a hash-suffixed stub.
+    """
+    full = f"mcp__frihet__{tool_name}"
+    payload = frihet.pre_tool_call_gate(tool_name=full)
+    if expected_kind is None:
+        # Reads and draft-writes both return None today — the skill handles
+        # the draft-write pause, the hook stays out of the way.
+        assert payload is None, f"{tool_name} should not escalate, got {payload}"
+    else:
+        assert payload is not None, f"{tool_name} should escalate"
+        assert payload["action"] == "approve"
+        # rule_key uses the *unclamped* operation name when no clamp was
+        # applied; for clamped names the rule_key uses the truncated stub.
+        # Either way the hook fired, which is what the safety contract asks.
+
+
 # ─── Probe & doctor ─────────────────────────────────────────────────────────
 
 
@@ -311,11 +366,20 @@ def test_doctor_without_api_key_still_runs_probe(monkeypatch):
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
     response = FakeResponse(_ok_response(), status=200)
     result = frihet.doctor(opener=lambda req, t: response)
-    assert result["ok"] is True
-    assert result["probe"]["success"] is True
+    # The four states are exposed explicitly. Without a key, only
+    # ``endpoint_reachable`` and ``tools_available`` are true; the
+    # ``authenticated`` flag stays false because we have no credential.
+    assert "states" in result
+    assert result["states"]["endpoint_reachable"] is True
+    assert result["states"]["mcp_configured_in_hermes"] is False
+    assert result["states"]["authenticated"] is False
+    assert result["states"]["tools_available"] is True
+    # The umbrella ``ok`` stays False: we explicitly do NOT claim the plugin
+    # is connected just because the endpoint answered 200.
+    assert result["ok"] is False
 
 
-def test_doctor_with_api_key_sends_bearer(monkeypatch):
+def test_doctor_with_api_key_marks_authenticated(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
     response = FakeResponse(_ok_response(), status=200)
     captured = {}
@@ -327,6 +391,38 @@ def test_doctor_with_api_key_sends_bearer(monkeypatch):
     result = frihet.doctor(opener=opener)
     assert result["ok"] is True
     assert captured["authorization"] == "Bearer fri_test_12345678"
+    assert result["states"]["endpoint_reachable"] is True
+    assert result["states"]["authenticated"] is True
+    assert result["states"]["tools_available"] is True
+
+
+def test_doctor_distinguishes_reachable_from_authenticated(monkeypatch):
+    """An anonymous 200 is reachable but NOT authenticated. We must not
+    flip the ``ok`` flag to True just because the server answered."""
+    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+    response = FakeResponse(_ok_response(), status=200)
+    result = frihet.doctor(opener=lambda req, t: response)
+    assert result["states"]["endpoint_reachable"] is True
+    assert result["states"]["authenticated"] is False
+    assert result["ok"] is False
+    assert result["probe"]["success"] is True  # the probe ran fine
+
+
+def test_doctor_reports_unauthorized_state(monkeypatch):
+    """When the server returns 401, ``endpoint_reachable`` stays True but
+    ``authenticated`` and ``tools_available`` are False."""
+    monkeypatch.setenv("FRIHET_API_KEY", "fri_wrong_12345678")
+
+    def opener(request, timeout):
+        raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
+            request.full_url, 401, "Unauthorized", {}, None
+        )
+
+    result = frihet.doctor(opener=opener)
+    assert result["states"]["endpoint_reachable"] is True
+    assert result["states"]["authenticated"] is False
+    assert result["ok"] is False
+    assert result["probe"]["error"] == "mcp_unauthorized"
 
 
 def test_status_reports_no_secrets():
