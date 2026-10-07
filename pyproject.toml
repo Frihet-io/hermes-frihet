@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-frihet"
+version = "0.1.0"
+description = "Official Hermes Agent plugin for Frihet — install, configure, diagnose, and operate the Frihet MCP from inside Hermes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Frihet-io" }]
+keywords = ["hermes", "hermes-agent", "plugin", "frihet", "erp", "mcp"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Framework :: Hermes Agent",
+]
+
+# No runtime dependencies on purpose.
+# The plugin only consumes Hermes' public PluginContext API and talks to the
+# canonical Frihet MCP endpoint over HTTPS using urllib (stdlib). Keeping
+# dependencies at zero keeps the catalog-admission floor uncontested and the
+# install footprint minimal.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-mock>=3.12"]
+
+[project.urls]
+Homepage = "https://github.com/Frihet-io/hermes-frihet"
+Issues = "https://github.com/Frihet-io/hermes-frihet/issues"
+Source = "https://github.com/Frihet-io/hermes-frihet"
+Canonical_MCP = "https://mcp.frihet.io/mcp"
+
+[tool.setuptools]
+py-modules = ["frihet"]
+
+[tool.setuptools.package-data]
+"frihet" = ["skills/frihet/SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

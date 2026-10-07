@@ -1,0 +1,22 @@
+name: frihet
+version: 0.1.0
+description: "Official Hermes Agent integration for Frihet — discoverability, setup, diagnostics, and operating guidance for the Frihet MCP. No duplicated tools; the canonical Frihet surface stays in the official MCP."
+author: "Frihet-io"
+license: "MIT"
+homepage: "https://github.com/Frihet-io/hermes-frihet"
+kind: standalone
+requires_hermes: ">=0.21.5"
+# No required env vars: the canonical Frihet MCP supports both Bearer
+# API key and OAuth 2.0 + PKCE. Credentials live on the ``mcp_servers.frihet``
+# block in config.yaml (or in the user's secret directory), not on the plugin.
+requires_env: []
+tags:
+  - frihet
+  - erp
+  - invoices
+  - business
+  - mcp
+provides_tools: []
+provides_hooks:
+  - pre_tool_call
+provides_middleware: []
