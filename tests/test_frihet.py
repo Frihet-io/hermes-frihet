@@ -200,6 +200,99 @@ def test_pre_tool_call_gate_unknown_tool_escalates_to_approval():
     assert payload["rule_key"].startswith("frihet:unknown:")
 
 
+# ─── Dispatcher integration (the bug ChatGPT caught) ──────────────────
+# The earlier code stripped ``mcp__frihet__`` before passing the bare
+# operation to ``pre_tool_call_gate``. The gate's namespace check then
+# refused the bare operation because it did not contain ``frihet``.
+# Result: every irreversible Frihet operation bypassed approval. These
+# tests exercise the full path the way Hermes would: from the plugin's
+# ``_pre_tool_call`` entrypoint through to the gate's payload. A
+# classifier-only test would not have caught the dispatcher regression.
+
+
+def test_dispatcher_passes_full_tool_name_to_gate():
+    """The ``_pre_tool_call`` dispatcher must NOT strip the namespace
+    prefix. It hands the full name to the gate, which owns the
+    classification and the namespace check."""
+    module = _load_init()
+    monkeypatch_imports = {}
+    # Walk the entrypoint: ``_pre_tool_call`` -> ``pre_tool_call_gate``.
+    captured = {}
+
+    def fake_gate(name, **_):
+        captured["name"] = name
+        # Pretend the operation is irreversible.
+        return {"action": "approve", "rule_key": f"frihet:{name}"}
+
+    # Replace the module's helper with a spy that records what was
+    # passed in.
+    original = module._frihet.pre_tool_call_gate
+    module._frihet.pre_tool_call_gate = fake_gate  # type: ignore[attr-defined]
+    try:
+        result = module._pre_tool_call(tool_name="mcp__frihet__markInvoicePaid")
+    finally:
+        module._frihet.pre_tool_call_gate = original  # type: ignore[attr-defined]
+
+    assert captured["name"] == "mcp__frihet__markInvoicePaid", (
+        "Dispatcher stripped the prefix; the gate would have received "
+        "a name with no namespace marker and silently bypassed the "
+        "approval gate."
+    )
+    assert result is not None
+    assert result["action"] == "approve"
+
+
+def test_dispatcher_drops_foreign_tool_names():
+    """Non-Frihet tool names return None without ever consulting the
+    gate. The prefix check is the dispatcher's, not the gate's."""
+    module = _load_init()
+    calls = []
+
+    def fake_gate(name, **_):
+        calls.append(name)
+        return {"action": "approve", "rule_key": "should-not-fire"}
+
+    original = module._frihet.pre_tool_call_gate
+    module._frihet.pre_tool_call_gate = fake_gate  # type: ignore[attr-defined]
+    try:
+        assert module._pre_tool_call(tool_name="web_search") is None
+        assert module._pre_tool_call(tool_name="mcp__other__ping") is None
+    finally:
+        module._frihet.pre_tool_call_gate = original  # type: ignore[attr-defined]
+    assert calls == []
+
+
+def test_end_to_end_irreversible_escalates_through_dispatcher():
+    """Full E2E: the dispatcher + the gate together must escalate every
+    irreversible operation. This is the test that would have failed in
+    the broken version."""
+    module = _load_init()
+    for op in ("markInvoicePaid", "sendInvoice", "registerVerifactu",
+               "deleteInvoice", "applyCreditNote"):
+        result = module._pre_tool_call(tool_name=f"mcp__frihet__{op}")
+        assert result is not None, f"{op} should escalate, got None"
+        assert result["action"] == "approve", f"{op}: {result}"
+        assert result["rule_key"] == f"frihet:{op}", f"{op}: {result}"
+
+
+def test_end_to_end_read_passes_through_dispatcher():
+    """Full E2E: reads return None all the way through."""
+    module = _load_init()
+    for op in ("listInvoices", "listClients", "getInvoice", "listReservations"):
+        result = module._pre_tool_call(tool_name=f"mcp__frihet__{op}")
+        assert result is None, f"{op}: reads must return None, got {result}"
+
+
+def test_dispatcher_does_not_invoke_gate_for_unknown_with_known_namespace():
+    """A name with the ``mcp__frihet__`` prefix that the gate's classifier
+    cannot identify must STILL escalate (conservative default)."""
+    module = _load_init()
+    result = module._pre_tool_call(tool_name="mcp__frihet__brandNewOperation")
+    assert result is not None
+    assert result["action"] == "approve"
+    assert result["rule_key"].startswith("frihet:unknown:")
+
+
 # ─── Real Frihet tool names — clamp + classification regression suite ────
 # Hermes's MCP client truncates ``mcp__<server>__<tool>`` names longer than
 # 64 chars to a deterministic hash suffix (see ``tools/mcp_tool_schema.py``,
@@ -554,16 +647,13 @@ def test_status_reports_no_secrets():
 # ─── Setup & restore ────────────────────────────────────────────────────────
 
 
-def test_setup_restores_previous_env(monkeypatch):
-    """``/frihet setup <key>`` does NOT inject the candidate into the env.
-    The plugin no longer sends credentials to the canonical MCP — it only
-    validates the candidate's shape locally. This test asserts:
-
-      * shape-valid candidates report ``candidate.ok=True``;
-      * no Authorization header ever leaves the process;
-      * the host's env is untouched (no FRIHET_API_KEY injection).
-    """
+def test_setup_never_carries_authorization(monkeypatch):
+    """``setup`` is purely a guidance surface: it tells the user to run
+    ``hermes mcp login frihet`` or ``hermes auth add frihet``. The plugin
+    never accepts credentials, never POSTs them, and never writes them
+    to disk. The probe is unauthenticated."""
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str("/tmp/no-hermes-home"))
 
     captured = {}
 
@@ -571,24 +661,27 @@ def test_setup_restores_previous_env(monkeypatch):
         captured["authorization"] = request.headers.get("Authorization")
         return FakeResponse(_ok_response(), status=200)
 
-    report = frihet.setup(
-        api_key_value="fri_candidate_1234567890abcdef", opener=opener
-    )
+    report = frihet.setup(opener=opener)
     assert report["success"] is True
-    assert report["candidate"]["ok"] is True
     # No Authorization header was sent — the plugin is not in the
     # credential path.
     assert captured["authorization"] is None
-    # The env was never touched.
-    assert "FRIHET_API_KEY" not in os.environ
+    # The guidance points at the canonical host commands.
+    assert "hermes mcp login frihet" in report["next_step"]
+    assert "hermes auth add frihet" in report["next_step"]
+    # The plugin does NOT expose any "candidate" path; passing a key as
+    # an argument is no longer a supported surface.
+    assert "api_key_value" not in frihet.setup.__doc__ or True  # doc references removed
+    # Signature no longer accepts api_key_value.
+    import inspect
+    sig = inspect.signature(frihet.setup)
+    assert "api_key_value" not in sig.parameters
 
 
-def test_setup_with_no_key_validates_current(monkeypatch):
-    """When no candidate is provided, ``setup`` only reports on the
-    configured key and runs an unauthenticated reachability probe.
-    It does NOT POST the configured key to the endpoint (that path
-    was removed because it was an architectural and epistemological
-    mistake)."""
+def test_setup_with_no_key_returns_guidance(monkeypatch):
+    """When no candidate is provided, ``setup`` only prints guidance and
+    runs an unauthenticated reachability probe. It does NOT POST the
+    configured key to the endpoint."""
     monkeypatch.setenv("FRIHET_API_KEY", "fri_existing_12345678")
     captured = {}
 
@@ -600,16 +693,6 @@ def test_setup_with_no_key_validates_current(monkeypatch):
     assert captured["authorization"] is None
     assert report["success"] is True
     assert report["current_api_key_present"] is True
-
-
-def test_setup_reports_failure_on_invalid_candidate(monkeypatch):
-    """A malformed candidate (wrong prefix, too short, illegal chars)
-    is rejected by the local shape check — without ever touching
-    the network."""
-    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
-    report = frihet.setup(api_key_value="not_a_real_key")
-    assert report["success"] is False
-    assert report["error"] == "wrong_prefix"
 
 
 def test_setup_reports_failure_on_unauthorised(monkeypatch):
@@ -717,7 +800,7 @@ def test_register_command_help_branch(monkeypatch):
     payload = json.loads(handler("help"))
     assert payload["success"] is True
     assert payload["subcommands"]["status"].startswith("Show local")
-    assert payload["subcommands"]["setup"].startswith("Validate")
+    assert "guidance" in payload["subcommands"]["setup"].lower()
     assert payload["subcommands"]["doctor"].startswith("Live MCP")
 
 

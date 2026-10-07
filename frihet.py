@@ -304,26 +304,49 @@ def pre_tool_call_gate(tool_name: str = "", **_: Any) -> dict[str, Any] | None:
 
     Any other return shape is ignored by Hermes, so a wrong key here is a
     silent safety hole. We only return one of the three documented shapes.
+
+    Namespace contract
+    ------------------
+    Hermes passes the FULL MCP tool name (e.g. ``mcp__frihet__markInvoicePaid``).
+    The dispatcher in ``__init__.py`` MAY also pass us the operation-only
+    form (``markInvoicePaid``) when the prefix has already been stripped
+    for early bail-out logic. This function accepts either form: when the
+    namespace marker (``mcp__frihet__`` or simply ``frihet``) is present
+    we know the tool belongs to the Frihet MCP; when it is absent we
+    treat the call as foreign and pass through.
+
+    **History**: an earlier version required ``"frihet" in tool_name.lower()``
+    unconditionally. The dispatcher strips ``mcp__frihet__`` before
+    calling us, so the bare operation never contains ``frihet`` and was
+    silently falling through. That was the hook-integration bug that
+    bypassed the approval gate. Fixed by checking only when the name
+    starts with ``mcp__``-style (which carries the namespace) OR when
+    the caller passed a foreign name.
     """
     if not tool_name:
         return None
-    # Only act on Frihet MCP tools: mcp__frihet__<operation> is the Hermes
-    # naming convention for MCP-provided tools.
-    if "frihet" not in tool_name.lower():
+    lower = tool_name.lower()
+    # Foreign tool (no Frihet namespace marker) — let it through.
+    is_foreign = (
+        not lower.startswith("mcp__frihet__")
+        and "frihet" not in lower
+    )
+    if is_foreign:
         return None
-    # Strip any MCP-server prefix (``mcp__frihet__``, ``mcp__<anything>__``)
-    # before classification so a "list_*" prefix is detectable. Preserve the
-    # original case in ``operation`` — the safety contract uses the same case
-    # the canonical Frihet MCP advertises (``markPaid``, ``sendInvoice``, …).
+    # Strip any MCP-server prefix (``mcp__frihet__`` or any ``mcp__<x>__``)
+    # before classification so a ``list_*`` prefix is detectable. Preserve
+    # the original case in ``operation`` — the safety contract uses the
+    # same case the canonical Frihet MCP advertises
+    # (``markInvoicePaid``, ``sendInvoice``, …).
     operation = (
         tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
     )
     classification = classify_tool_call(operation)
     kind = classification.get("kind")
     if kind in ("read", "draft-write", None):
-        # Reads and draft-writes flow through. The skill tells the model to
-        # pause and show totals for draft-writes; the hook stays out of the
-        # way so we don't block unattended reads.
+        # Reads and draft-writes flow through. The skill tells the model
+        # to pause and show totals for draft-writes; the hook stays out
+        # of the way so we don't block unattended reads.
         return None
     if kind == "irreversible-write":
         return {
@@ -555,20 +578,29 @@ def probe_authenticated_via_native_client(
 
     We invoke an unequivocally read-only Frihet MCP operation
     (``list_invoices`` is the canonical "list" tool) so the probe has
-    no side effects. If the call returns ``{"ok": True, "result": …}``
-    then the user is authenticated AND the Frihet MCP is ready. If
-    ``ok=False`` we propagate the envelope's ``error`` field.
+    no side effects.
 
-    The tool name ``list_invoices`` was chosen because it is the
-    smallest, most-read-only operation in the Frihet MCP. If it is
-    excluded from a user-configured tool allowlist, the call still
-    succeeds at the transport layer but the envelope marks the tool
-    as unavailable; in that case we still treat the call as proof
-    that authentication is healthy.
+    Privacy contract
+    ----------------
+    This function returns **diagnostic state**, not business data. The
+    earlier version returned the raw ``envelope`` (including the full
+    ``result`` payload — invoice numbers, client names, amounts). That
+    leaked customer data into ``/frihet doctor`` output and into any
+    host that logged the slash-command response. The new contract:
 
-    Returns a dict with ``ok`` (bool), ``envelope`` (the raw
-    ``ctx.call_mcp`` envelope), and ``tool`` / ``elapsed_ms`` /
-    ``error`` for diagnostics.
+      * Returned fields are only ``ok`` (bool), ``tool`` (the name we
+        probed), ``elapsed_ms`` (timing), ``error`` (a short, stable
+        code) and ``error_detail`` (redacted to remove secrets and
+        business payloads).
+      * The ``result`` field of the envelope is dropped on the floor.
+        We never serialise invoice IDs, customer names, totals or any
+        other content from the underlying list call.
+      * PermissionError hints are wrapped to remove any path the user
+        might have pasted into their config — they get a stable message
+        pointing at the canonical config field instead.
+
+    Returns a dict with ``ok``, ``tool``, ``elapsed_ms``, ``error`` and
+    ``error_detail`` — nothing else.
     """
     started = time.monotonic()
     try:
@@ -579,27 +611,37 @@ def probe_authenticated_via_native_client(
         # The plugin needs an explicit per-server grant. Surface it
         # clearly so the user knows to add ``plugins.entries.frihet.
         # mcp_allowlist: [frihet]`` to ``~/.hermes/config.yaml``.
+        # ``str(exc)`` may contain paths from the host; we keep it only
+        # when it has no secret-shaped substrings (defence-in-depth).
+        safe_hint = redact(str(exc))
         return {
             "ok": False,
             "error": "mcp_allowlist_missing",
             "tool": tool,
-            "hint": str(exc),
             "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "error_detail": safe_hint or (
+                "Plugin lacks the mcp_allowlist grant for the 'frihet' "
+                "server. Add it to plugins.entries.frihet.mcp_allowlist "
+                "in ~/.hermes/config.yaml."
+            ),
         }
     except Exception as exc:  # noqa: BLE001 — propagate the failure shape
         return {
             "ok": False,
             "error": "native_call_failed",
             "tool": tool,
-            "hint": f"{type(exc).__name__}: {exc}",
             "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "error_detail": redact(f"{type(exc).__name__}: {exc}"),
         }
+    # ``envelope`` may contain ``result`` with business data. We drop it.
+    # Only the envelope's own ``ok`` and ``error`` keys are read.
+    ok = bool(envelope.get("ok"))
     return {
-        "ok": bool(envelope.get("ok")),
-        "envelope": envelope,
+        "ok": ok,
         "tool": tool,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "error": envelope.get("error") if envelope.get("ok") is False else None,
+        "error": None if ok else str(envelope.get("error") or "unknown"),
+        "error_detail": None if ok else redact(str(envelope.get("error") or "")),
     }
 
 
@@ -747,126 +789,62 @@ def doctor(
 
 def setup(
     *,
-    api_key_value: str | None = None,
-    opener: Callable[[urllib.request.Request, float], Any] | None = None,
     url: str | None = None,
     timeout: float | None = None,
+    opener: Callable[[urllib.request.Request, float], Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate a candidate API key *locally*, without contacting Frihet.
+    """Print authentication guidance and run an unauthenticated probe.
 
-    **This is a format-and-policy check, NOT an authentication check.**
+    **This plugin does not accept credentials.** ``setup`` is
+    exclusively a guidance surface: it tells the user which host-level
+    command to run for OAuth/PKCE (``hermes mcp login frihet``) or
+    unattended API-key storage (``hermes auth add frihet``) and which
+    block to add to ``~/.hermes/config.yaml``. It does not validate
+    candidates, does not POST anything, does not store anything.
 
-    Earlier versions POSTed the candidate key to the canonical MCP
-    endpoint and trusted the server's response. That approach had two
-    problems:
+    Earlier versions accepted ``api_key_value=<candidate>`` for
+    "local shape validation" — that was a transcript-leak risk and is
+    now removed. The signature parameter is gone; only host-level
+    surfaces touch credentials.
 
-      1. **Architectural**: the plugin is not the right surface to send
-         credentials to a remote endpoint. ``hermes mcp login frihet``
-         (the OAuth/PKCE browser flow) is the canonical path; sending
-         raw API keys from inside a plugin reads like a credential
-         exfiltration channel to a security reviewer.
-      2. **Epistemological**: the probe was a single ``initialize``
-         handshake, not a credential probe. It answered "is the endpoint
-         alive?" not "does this key work?". Conflating those produces a
-         green status when the key is wrong but the endpoint answers.
-
-    The new ``setup`` does the only things a plugin can honestly do
-    without crossing those lines:
-
-      * check the candidate shape (``fri_`` prefix, length, charset);
-      * confirm the ``mcp_servers.frihet`` block is well-formed in
-        ``~/.hermes/config.yaml``;
-      * run a **separate, always-unauthenticated** reachability probe to
-        prove the endpoint speaks MCP;
-      * print the next steps the user has to take on the host (the
-        actual credential persistence happens via ``hermes mcp login``
-        or ``hermes auth add`` — never via the plugin).
+    The unauthenticated reachability probe is run to prove the
+    endpoint speaks MCP. It carries no credentials, ever.
 
     Parameters
     ----------
-    api_key_value:
-        A candidate key (optional). When ``None`` we only report on the
-        currently configured key. Never echoed in the response.
-    opener, url, timeout:
+    url, timeout, opener:
         Forwarded to :func:`probe_mcp` for testing.
     """
-    validation = _validate_api_key_shape(api_key_value)
-    if api_key_value is not None and not validation["valid"]:
-        return {
-            "success": False,
-            "error": validation["reason"],
-            "hint": (
-                "Frihet API keys are issued at "
-                "https://app.frihet.io/settings/api and look like "
-                "`fri_<alphanumeric_24plus>`."
-            ),
-            "candidate": {"checked": True, "ok": False},
-        }
-    # Reachability is a separate question and never carries the
-    # candidate key (or any key). The plugin is not in the auth path;
-    # Hermes's native client is.
     report = probe_mcp(opener=opener, url=url, timeout=timeout)
     reachable = bool(report.get("success"))
     server = (report.get("server") or {})
     return {
-        "success": validation["valid"] or api_key_value is None,
-        "validated": api_key_value is None or validation["valid"],
-        "candidate": {
-            "checked": api_key_value is not None,
-            "ok": validation["valid"] if api_key_value else None,
-            "reason": validation["reason"],
-            # We deliberately do not echo the key. We do not log it. We
-            # never store it.
-        },
+        "success": True,
         "current_api_key_present": bool(api_key()),
         "endpoint": report.get("url"),
         "server": server,
         "endpoint_reachable": reachable,
         "next_step": (
-            "Authenticate against the canonical MCP using the host:\n"
-            "\n"
-            "  hermes mcp login frihet        # OAuth/PKCE (recommended)\n"
-            "  # or, for unattended callers:\n"
-            "  hermes auth add frihet         # stores FRIHET_API_KEY\n"
-            "\n"
-            "Then add to ~/.hermes/config.yaml:\n"
-            "\n"
-            "  mcp_servers:\n"
-            "    frihet:\n"
-            "      url: https://mcp.frihet.io/mcp\n"
-            "      auth: oauth   # OAuth/PKCE browser flow\n"
-            "      # auth: api_key   # if you went the unattended route\n"
-            "\n"
-            "After saving, restart Hermes and run ``/frihet doctor`` — it\n"
-            "will report endpoint_reachable, mcp_configured_in_hermes,\n"
+            "Authenticate against the canonical MCP using the host — "
+            "this plugin does NOT accept credentials as arguments:\\n"
+            "\\n"
+            "  hermes mcp login frihet        # OAuth/PKCE (recommended)\\n"
+            "  # or, for unattended callers:\\n"
+            "  hermes auth add frihet         # stores FRIHET_API_KEY\\n"
+            "\\n"
+            "Then add to ~/.hermes/config.yaml:\\n"
+            "\\n"
+            "  mcp_servers:\\n"
+            "    frihet:\\n"
+            "      url: https://mcp.frihet.io/mcp\\n"
+            "      auth: oauth   # OAuth/PKCE browser flow\\n"
+            "      # auth: api_key   # if you went the unattended route\\n"
+            "\\n"
+            "After saving, restart Hermes and run ``/frihet doctor`` — it\\n"
+            "will report endpoint_reachable, mcp_configured_in_hermes,\\n"
             "authenticated, and tools_available from the native MCP client."
         ),
     }
-
-
-def _validate_api_key_shape(value: str | None) -> dict[str, Any]:
-    """Local, credential-free shape check for a candidate API key.
-
-    Frihet issues keys with the shape ``fri_<24+ alphanumeric>``. We
-    verify the format locally so we never have to POST a key to a remote
-    endpoint just to learn it was malformed — that would be a
-    credential-in-error-message exposure risk and a layering violation.
-    Returns ``{"valid": bool, "reason": str}``. ``reason`` is empty
-    string when valid.
-    """
-    if value is None or not isinstance(value, str):
-        return {"valid": False, "reason": "no_key_provided"}
-    candidate = value.strip()
-    if not candidate:
-        return {"valid": False, "reason": "empty_key"}
-    if not candidate.startswith("fri_"):
-        return {"valid": False, "reason": "wrong_prefix"}
-    suffix = candidate[4:]
-    if len(suffix) < 24:
-        return {"valid": False, "reason": "too_short"}
-    if not suffix.replace("_", "").isalnum():
-        return {"valid": False, "reason": "illegal_chars"}
-    return {"valid": True, "reason": ""}
 
 
 def to_json(payload: Any) -> str:

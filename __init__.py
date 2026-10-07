@@ -43,11 +43,32 @@ _FRIHET_TOOL_PREFIX = "mcp__frihet__"
 
 
 def _pre_tool_call(tool_name: str = "", **_: Any) -> dict[str, Any] | None:
-    """Hook payload: surface safety hints for irreversible Frihet writes."""
+    """Plugin ``pre_tool_call`` hook dispatcher.
+
+    **Pass the full tool name to the gate.** The earlier version stripped
+    the ``mcp__frihet__`` prefix here and passed only the bare operation
+    (``markInvoicePaid``). The gate then refused the call because its
+    namespace check looked for ``"frihet"`` in the input, which the bare
+    operation never contained. Result: every irreversible Frihet
+    operation bypassed the approval gate. This was a silent safety
+    regression — the unit tests on the classifier never crossed the
+    dispatcher boundary.
+
+    The contract is now:
+
+      1. Foreign tools (no ``mcp__frihet__`` prefix) — ``None``, the
+         caller is not ours, let it flow.
+      2. Frihet tools — pass the *full* name to
+         ``_frihet.pre_tool_call_gate`` which owns the namespace check,
+         classification, and approval-payload shape.
+
+    Hermes dispatches every ``pre_tool_call`` to this function across
+    plugins; the gate is the single source of truth for the safety
+    decision.
+    """
     if not tool_name or not tool_name.startswith(_FRIHET_TOOL_PREFIX):
         return None
-    operation = tool_name[len(_FRIHET_TOOL_PREFIX):]
-    return _frihet.pre_tool_call_gate(operation)
+    return _frihet.pre_tool_call_gate(tool_name)
 
 
 def _make_command(ctx: Any):
@@ -66,19 +87,43 @@ def _make_command(ctx: Any):
     and reconnect) — the plugin itself never reads tokens.
     """
     def _command(raw_args: str) -> str:
+        """Slash-command handler for ``/frihet <status|setup|doctor>``.
+
+        ``/frihet setup`` no longer accepts an inline key argument. Passing
+        a key in chat would leave it in the transcript and in any host log
+        that captures slash-command output. Authentication is a host-only
+        concern: use ``hermes mcp login frihet`` (OAuth/PKCE) or
+        ``hermes auth add frihet`` for unattended API keys. The slash
+        command therefore only prints guidance — it does not accept,
+        validate, or store credentials.
+
+        Returns a JSON string. Failures carry an ``error`` code so the user
+        (and the host adapter) can branch on it. Secrets are never echoed.
+        """
         parts = raw_args.strip().split()
         action = parts[0].lower() if parts else "status"
-        if action == "status":
+        extra = parts[1:]
+        if extra:
+            # Refuse extra positional arguments across every subcommand.
+            # This is the single guardrail for "user pasted an API key in
+            # chat" — we reject it loudly instead of swallowing it.
+            result = {
+                "success": False,
+                "error": "unexpected_arguments",
+                "subcommand": action,
+                "unexpected_args": extra,
+                "usage": "/frihet <status|setup|doctor>",
+                "hint": (
+                    "This plugin never accepts credentials as slash-command "
+                    "arguments — they would land in the chat transcript. "
+                    "Authenticate with `hermes mcp login frihet` (OAuth/PKCE) "
+                    "or `hermes auth add frihet` (unattended API key)."
+                ),
+            }
+        elif action == "status":
             result = _frihet.status()
         elif action == "setup":
-            # Two layouts supported:
-            #   /frihet setup                  -> validate the currently configured key.
-            #   /frihet setup <api_key_value>  -> validate a candidate pasted in-chat
-            #                                    (NOT recommended — the key then lives
-            #                                    in the transcript. Prefer /frihet
-            #                                    status -> Hermes native auth path.)
-            candidate = parts[1] if len(parts) > 1 else None
-            result = _frihet.setup(api_key_value=candidate)
+            result = _frihet.setup()
         elif action == "doctor":
             # Pass ctx so the doctor can authoritatively verify auth via
             # ``ctx.call_mcp``. Without ctx, doctor() reports
@@ -91,7 +136,11 @@ def _make_command(ctx: Any):
                 "usage": "/frihet <status|setup|doctor>",
                 "subcommands": {
                     "status": "Show local plugin config (no network).",
-                    "setup": "Validate FRIHET_API_KEY and print the MCP server block.",
+                    "setup": (
+                        "Print guidance for authenticating against the "
+                        "canonical Frihet MCP via the host. Does not accept "
+                        "credentials as arguments."
+                    ),
                     "doctor": (
                         "Live MCP probe — reports endpoint_reachable, "
                         "mcp_configured_in_hermes, authenticated, and "
