@@ -48,7 +48,6 @@ CLIENT_VERSION = "0.1.0"
 
 DEFAULT_HERMES_HOME = os.path.expanduser("~/.hermes")
 CONFIG_FILENAME = "config.yaml"
-MCP_TOKEN_FILENAME = "mcp-tokens"  # dir containing <name>.json per MCP server
 
 
 def hermes_home() -> str:
@@ -61,45 +60,6 @@ def hermes_home() -> str:
     """
     raw = os.getenv("HERMES_HOME", "").strip()
     return raw or DEFAULT_HERMES_HOME
-
-
-def cached_oauth_token(name: str = "frihet") -> str | None:
-    """Read the OAuth access token that the Hermes native MCP client
-    cached for the named server, if present.
-
-    Hermes writes tokens under ``$HERMES_HOME/mcp-tokens/<name>.json``
-    after a successful ``hermes mcp login`` or the Desktop's OAuth
-    flow. The schema is what ``HermesTokenStorage`` writes (an
-    ``access_token`` field among others). Reading this file is the
-    documented user-visible contract — the same file the user can
-    inspect themselves — not an internal API.
-
-    We only read the token. We never write to this directory. We
-    NEVER log it. ``redact()`` handles any accidental echo.
-
-    Returns ``None`` if the file is missing, malformed, the token is
-    expired, or there is no ``access_token`` field. The caller treats
-    this exactly like ``api_key()`` returning ``""``.
-    """
-    home = hermes_home()
-    token_path = os.path.join(home, MCP_TOKEN_FILENAME, f"{name}.json")
-    if not os.path.isfile(token_path):
-        return None
-    try:
-        with open(token_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    access = data.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    # Respect expiry when the cache file does.
-    exp = data.get("expires_at")
-    if isinstance(exp, (int, float)) and exp > 0 and exp < time.time():
-        return None
-    return access.strip()
 
 
 def mcp_server_block_present(name: str = "frihet") -> str | None:
@@ -392,6 +352,20 @@ def pre_tool_call_gate(tool_name: str = "", **_: Any) -> dict[str, Any] | None:
 
 
 def _build_initialize_request(url: str) -> urllib.request.Request:
+    """Build the JSON-RPC ``initialize`` request we send for the reachability
+    probe.
+
+    **This request carries NO credentials.** Not a Bearer API key, not an
+    OAuth token, not a User-Agent pretending to be a browser. The probe
+    only proves the endpoint is reachable and speaks the MCP shape; the
+    plugin never authoritatively authenticates.
+
+    Authentication status (``authenticated``, ``tools_available``) is
+    derived from an actual call through ``ctx.call_mcp()`` — the public
+    Hermes API that uses Hermes's own native MCP client, including its
+    OAuth cache, breaker, and reconnect. The plugin never reads or
+    handles credentials directly.
+    """
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -402,20 +376,11 @@ def _build_initialize_request(url: str) -> urllib.request.Request:
             "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
         },
     }
-    key = api_key()
-    oauth = cached_oauth_token()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "User-Agent": f"{CLIENT_NAME}/{CLIENT_VERSION}",
     }
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    elif oauth:
-        # OAuth flow has cached a token. Prefer it over no credential.
-        # Never log the token; the redact() function masks it on any
-        # accidental echo.
-        headers["Authorization"] = f"Bearer {oauth}"
     return urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -448,21 +413,27 @@ def probe_mcp(
     timeout: float | None = None,
     opener: Callable[[urllib.request.Request, float], Any] | None = None,
 ) -> dict[str, Any]:
-    """Send an MCP ``initialize`` and surface the MCP server's ``serverInfo``.
+    """Send an unauthenticated MCP ``initialize`` handshake to the endpoint.
 
-    Read-only: the ``initialize`` handshake never mutates Frihet state. The
-    probe verifies that:
+    This probe is **reachability-only**. It does NOT carry credentials
+    and does NOT claim authentication state. Its job is to answer a
+    single question: does this URL respond with a recognisable MCP
+    shape?
 
-    * the endpoint URL is reachable,
-    * the API key (if configured) authenticates successfully,
-    * the server speaks a recognisable MCP shape.
+    Authentication evidence comes from a separate path:
+    ``probe_authenticated_via_native_client`` below, which uses
+    ``ctx.call_mcp`` — Hermes's public plugin-call surface — and lets
+    Hermes's native MCP client carry the credentials (its OAuth cache,
+    its breaker, its reconnect). The plugin itself never touches a
+    token.
 
-    Parameters
-    ----------
-    url, timeout:
-        Override the configured endpoint and timeout. Used by tests.
-    opener:
-        Replace ``urlopen`` for tests (avoids any real network call).
+    Returns a dict with ``success``, ``status``, ``server`` (name,
+    version, protocol_version), ``elapsed_ms``, and ``error`` for
+    failure modes (``malformed_url``, ``mcp_unauthorized``,
+    ``mcp_unreachable``, ``mcp_timeout``, ``malformed_response``,
+    ``mcp_http_error``). ``presented_credential`` is always False for
+    this probe — by design — so doctor() can never confuse "reachable"
+    with "authenticated".
     """
     target = (url or mcp_url()).strip() or DEFAULT_MCP_URL
     seconds = timeout if timeout is not None else timeout_seconds()
@@ -472,18 +443,12 @@ def probe_mcp(
             "success": False,
             "error": "malformed_url",
             "url": redact(target),
-            "presented_credential": bool(api_key()),
+            "presented_credential": False,
             "hint": "FRIHET_MCP_URL must be a full https:// URL.",
         }
     request = _build_initialize_request(target)
     open_fn = opener or urllib.request.urlopen
     started = time.monotonic()
-    # ``presented_credential`` is true when we actually sent an
-    # Authorization header — either via FRIHET_API_KEY or via the cached
-    # OAuth token. It must reflect what we SENT, not what the server
-    # said, so doctor() can reason honestly about anonymous probes.
-    auth_header = request.headers.get("Authorization", "").strip()
-    presented_credential = bool(auth_header)
     try:
         # ``urlopen(request, timeout=...)`` — never pass timeout as the
         # second positional argument; that slot is ``data`` (the request
@@ -501,11 +466,13 @@ def probe_mcp(
                 "url": redact(target),
                 "status": exc.code,
                 "elapsed_ms": elapsed,
-                "presented_credential": presented_credential,
+                "presented_credential": False,
                 "hint": (
-                    "FRIHET_API_KEY is missing or rejected. Generate one at "
-                    "https://app.frihet.io/settings/api and store it in "
-                    "your Hermes secret directory."
+                    "Server requires credentials. Run `hermes mcp login "
+                    "frihet` (browser PKCE) or set FRIHET_API_KEY for "
+                    "unattended callers. Authenticated status will be "
+                    "verified by /frihet doctor via Hermes's native MCP "
+                    "client."
                 ),
             }
         return {
@@ -514,7 +481,7 @@ def probe_mcp(
             "url": redact(target),
             "status": exc.code,
             "elapsed_ms": elapsed,
-            "presented_credential": presented_credential,
+            "presented_credential": False,
         }
     except urllib.error.URLError as exc:
         elapsed = round((time.monotonic() - started) * 1000)
@@ -524,7 +491,7 @@ def probe_mcp(
             "error": "mcp_unreachable",
             "url": redact(target),
             "elapsed_ms": elapsed,
-            "presented_credential": presented_credential,
+            "presented_credential": False,
             "reason": redact(str(reason)),
             "hint": (
                 "Cannot reach the Frihet MCP endpoint. Check your network "
@@ -538,7 +505,7 @@ def probe_mcp(
             "error": "mcp_timeout",
             "url": redact(target),
             "timeout_s": seconds,
-            "presented_credential": presented_credential,
+            "presented_credential": False,
             "hint": (
                 "The MCP probe exceeded the configured timeout. Increase "
                 "FRIHET_MCP_TIMEOUT_SECONDS or check your network latency."
@@ -553,7 +520,7 @@ def probe_mcp(
             "error": "malformed_response",
             "url": redact(target),
             "elapsed_ms": elapsed,
-            "presented_credential": presented_credential,
+            "presented_credential": False,
             "preview": redact(raw[:200]),
         }
     server_info = (parsed_body.get("result") or {}).get("serverInfo") or {}
@@ -563,12 +530,76 @@ def probe_mcp(
         "url": redact(target),
         "elapsed_ms": elapsed,
         "status": status,
-        "presented_credential": presented_credential,
+        "presented_credential": False,
         "server": {
             "name": str(server_info.get("name") or ""),
             "version": str(server_info.get("version") or ""),
             "protocol_version": protocol,
         },
+    }
+
+
+def probe_authenticated_via_native_client(
+    ctx: Any,
+    *,
+    tool: str = "list_invoices",
+    arguments: dict[str, Any] | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Verify authentication through Hermes's own native MCP client.
+
+    ``ctx.call_mcp`` is the **public** plugin-call surface in
+    ``hermes_cli/plugins.py``. It uses the same trust gates, breaker,
+    reconnect, and OAuth token cache as any other in-Hermes MCP call
+    — Hermes stays the sole owner of credentials and authorisation.
+
+    We invoke an unequivocally read-only Frihet MCP operation
+    (``list_invoices`` is the canonical "list" tool) so the probe has
+    no side effects. If the call returns ``{"ok": True, "result": …}``
+    then the user is authenticated AND the Frihet MCP is ready. If
+    ``ok=False`` we propagate the envelope's ``error`` field.
+
+    The tool name ``list_invoices`` was chosen because it is the
+    smallest, most-read-only operation in the Frihet MCP. If it is
+    excluded from a user-configured tool allowlist, the call still
+    succeeds at the transport layer but the envelope marks the tool
+    as unavailable; in that case we still treat the call as proof
+    that authentication is healthy.
+
+    Returns a dict with ``ok`` (bool), ``envelope`` (the raw
+    ``ctx.call_mcp`` envelope), and ``tool`` / ``elapsed_ms`` /
+    ``error`` for diagnostics.
+    """
+    started = time.monotonic()
+    try:
+        envelope = ctx.call_mcp(
+            "frihet", tool, arguments or {}, timeout=timeout
+        )
+    except PermissionError as exc:
+        # The plugin needs an explicit per-server grant. Surface it
+        # clearly so the user knows to add ``plugins.entries.frihet.
+        # mcp_allowlist: [frihet]`` to ``~/.hermes/config.yaml``.
+        return {
+            "ok": False,
+            "error": "mcp_allowlist_missing",
+            "tool": tool,
+            "hint": str(exc),
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+    except Exception as exc:  # noqa: BLE001 — propagate the failure shape
+        return {
+            "ok": False,
+            "error": "native_call_failed",
+            "tool": tool,
+            "hint": f"{type(exc).__name__}: {exc}",
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+    return {
+        "ok": bool(envelope.get("ok")),
+        "envelope": envelope,
+        "tool": tool,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+        "error": envelope.get("error") if envelope.get("ok") is False else None,
     }
 
 
@@ -612,74 +643,102 @@ def doctor(
     url: str | None = None,
     timeout: float | None = None,
     opener: Callable[[urllib.request.Request, float], Any] | None = None,
+    ctx: Any | None = None,
 ) -> dict[str, Any]:
     """Run the liveness probe and return a structured report.
 
     Epistemological contract: every state is ``true``, ``false`` or
-    ``"unknown"``. We do NOT collapse into a single ``ok`` boolean
-    because the four states are NOT the same thing and conflating them
-    is what made the previous version look "smart" while lying to the
-    user (it set ``mcp_configured_in_hermes = true`` whenever an API
-    key was set, even though OAuth-only flows have no API key at all).
+    ``"unknown"``. The plugin never collapses the four states into a
+    single ``ok`` flag because ``reachable != authenticated != ready``
+    and conflating them is what made earlier versions lie.
 
     States returned:
 
-      * ``endpoint_reachable`` (bool) — did the MCP handshake land on a
-        server? HTTP 2xx/4xx/5xx all count.
-      * ``mcp_configured_in_hermes`` (tri-state) — did ``$HERMES_HOME/
+      * ``endpoint_reachable`` (bool) — did the unauthenticated MCP
+        ``initialize`` handshake land on a server? HTTP 2xx/4xx/5xx all
+        count; the probe carries no credentials.
+      * ``mcp_configured_in_hermes`` (tri-state) — does ``$HERMES_HOME/
         config.yaml`` carry an ``mcp_servers.frihet`` block? We parse
-        that file directly (it is the user-visible contract) rather than
+        that file directly (the user-visible contract) rather than
         reaching into ``hermes_cli.mcp_config`` internals. ``unknown``
         means we could not read the file — we refuse to lie.
-      * ``authenticated`` (tri-state) — did the MCP handshake succeed
-        with our credential? ``true``/``false`` are observable facts;
-        ``"unknown"`` only happens when the probe was not run (we still
-        run it even without a key, so this is rarely unknown).
-      * ``tools_available`` (tri-state) — did the server's ``initialize``
-        response carry a populated ``serverInfo`` and parse as MCP?
-        Same tri-state contract.
+      * ``authenticated`` (tri-state) — evidence comes from one of two
+        paths, never both, and never by reading tokens ourselves:
+          1. When called with ``ctx`` (the live PluginContext from
+             ``register(ctx)``), we ask Hermes's native MCP client via
+             ``ctx.call_mcp("frihet", "list_invoices", {})`` to make a
+             read-only call. ``True`` iff the envelope is ``ok``; ``False``
+             iff the call failed (auth, transport, or allowlist); the
+             allowlist-missing case stays ``unknown`` because the
+             failure is about *plugin configuration*, not auth.
+          2. When called without ``ctx`` (CLI / unit tests), we cannot
+             authoritatively answer auth. We report ``unknown`` and
+             ask the user to run ``/frihet doctor`` from inside Hermes.
+      * ``tools_available`` (tri-state) — same logic: ``True`` iff the
+        native call returned a tool result envelope; ``False`` iff it
+        failed; ``unknown`` when we cannot ask.
 
-    The umbrella ``ok`` is ``True`` only when all four states are
-    ``True``. Reachability alone is not enough.
+    The umbrella ``ok`` flips ``True`` only when every state is the
+    literal ``True`` bool OR the positive tri-state ``"configured"``.
+    Anything else (``False`` or ``"unknown"``) keeps the umbrella at
+    ``False``. We never report the plugin "connected" based on HTTP
+    reachability alone.
 
-    The probe is ALWAYS run. When ``FRIHET_API_KEY`` is unset we send
-    the handshake without an Authorization header — the canonical Frihet
-    MCP may answer (demo / OAuth discovery) or reject with 401, and
-    either outcome is information the user needs.
+    The unauthenticated probe is ALWAYS run (it carries no credentials
+    so it is safe regardless of state). The native ``ctx.call_mcp`` is
+    run only when ``ctx`` is provided.
     """
     snapshot = status()
     probe = probe_mcp(url=url, timeout=timeout, opener=opener)
 
     reachable = bool(probe.get("status"))
     mcp_shape = bool(probe.get("server", {}).get("name"))
-    unauth = probe.get("error") == "mcp_unauthorized"
     server_block = mcp_server_block_present("frihet")
-    presented_credential = bool(probe.get("presented_credential"))
 
-    # Tri-state logic: ``authenticated`` is True ONLY when we presented a
-    # credential AND the server accepted it. We do NOT report ``True``
-    # for an anonymous 200 — that is reachable but not authenticated.
-    probe_succeeded = probe.get("success") is True and not unauth
+    # Authentication / tools-available evidence — native client only.
+    auth_evidence: dict[str, Any] | None = None
+    if ctx is not None:
+        auth_evidence = probe_authenticated_via_native_client(ctx)
+
+    if ctx is None:
+        # CLI / unit-test path — we cannot authoritatively prove auth
+        # without the live PluginContext. Tri-state: unknown.
+        authenticated_state: Any = "unknown"
+        tools_available_state: Any = "unknown"
+    elif auth_evidence is None:
+        authenticated_state = "unknown"
+        tools_available_state = "unknown"
+    elif auth_evidence.get("error") == "mcp_allowlist_missing":
+        # The plugin has not been granted access yet. The user needs
+        # to add ``plugins.entries.frihet.mcp_allowlist: [frihet]``
+        # to ``~/.hermes/config.yaml``. We refuse to call this
+        # 'unauthenticated' — it is a *plugin-config* question.
+        authenticated_state = "allowlist_not_granted"
+        tools_available_state = "allowlist_not_granted"
+    elif auth_evidence.get("ok") is True:
+        authenticated_state = True
+        tools_available_state = True
+    else:
+        # Native call genuinely failed — server reachable but auth
+        # broken or the operation rejected.
+        authenticated_state = False
+        tools_available_state = False
+
     states: dict[str, Any] = {
         "endpoint_reachable": reachable,
         "mcp_configured_in_hermes": server_block,  # tri-state string
-        "authenticated": (
-            "unknown"
-            if probe.get("error") == "probe_skipped"
-            else (probe_succeeded and presented_credential)
-        ),
-        "tools_available": (
-            "unknown"
-            if probe.get("error") == "probe_skipped"
-            else (mcp_shape and probe_succeeded)
-        ),
+        "authenticated": authenticated_state,
+        "tools_available": tools_available_state,
     }
 
     snapshot["probe"] = probe
+    snapshot["auth_evidence"] = auth_evidence
     snapshot["states"] = states
+
     # Umbrella ``ok`` only when every state is the literal ``True`` bool
-    # OR the positive tri-state ``"configured"``. Anything else (False or
-    # ``"unknown"``) keeps the umbrella at False.
+    # OR the positive tri-state ``"configured"``. The new
+    # ``"allowlist_not_granted"`` is explicitly NOT good — it tells the
+    # user to grant access before we can claim connectivity.
     def _is_good(value: Any) -> bool:
         return value is True or value == "configured"
     snapshot["ok"] = all(_is_good(v) for v in states.values())
@@ -693,60 +752,121 @@ def setup(
     url: str | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Validate a candidate API key without storing it.
+    """Validate a candidate API key *locally*, without contacting Frihet.
 
-    The plugin does NOT write secrets to disk. ``setup`` is a guided
-    *validation* step: the caller (typically the ``/frihet setup`` slash
-    command) is expected to persist the value into the user's Hermes secret
-    directory using the host's public APIs (``hermes auth add`` for example,
-    or the ``mcp_servers.frihet.env`` block). This function returns whether
-    the candidate key authenticates, and what scope/name it has, so the
-    operator can decide where to persist it.
+    **This is a format-and-policy check, NOT an authentication check.**
+
+    Earlier versions POSTed the candidate key to the canonical MCP
+    endpoint and trusted the server's response. That approach had two
+    problems:
+
+      1. **Architectural**: the plugin is not the right surface to send
+         credentials to a remote endpoint. ``hermes mcp login frihet``
+         (the OAuth/PKCE browser flow) is the canonical path; sending
+         raw API keys from inside a plugin reads like a credential
+         exfiltration channel to a security reviewer.
+      2. **Epistemological**: the probe was a single ``initialize``
+         handshake, not a credential probe. It answered "is the endpoint
+         alive?" not "does this key work?". Conflating those produces a
+         green status when the key is wrong but the endpoint answers.
+
+    The new ``setup`` does the only things a plugin can honestly do
+    without crossing those lines:
+
+      * check the candidate shape (``fri_`` prefix, length, charset);
+      * confirm the ``mcp_servers.frihet`` block is well-formed in
+        ``~/.hermes/config.yaml``;
+      * run a **separate, always-unauthenticated** reachability probe to
+        prove the endpoint speaks MCP;
+      * print the next steps the user has to take on the host (the
+        actual credential persistence happens via ``hermes mcp login``
+        or ``hermes auth add`` — never via the plugin).
 
     Parameters
     ----------
     api_key_value:
-        A candidate key. If ``None``, ``setup`` checks the currently
-        configured key. Never echoed in the response.
+        A candidate key (optional). When ``None`` we only report on the
+        currently configured key. Never echoed in the response.
     opener, url, timeout:
         Forwarded to :func:`probe_mcp` for testing.
     """
-    original = api_key()
-    try:
-        if api_key_value:
-            os.environ["FRIHET_API_KEY"] = api_key_value
-        report = probe_mcp(opener=opener, url=url, timeout=timeout)
-    finally:
-        # Restore the prior value even if validation raised.
-        if api_key_value:
-            if original:
-                os.environ["FRIHET_API_KEY"] = original
-            else:
-                os.environ.pop("FRIHET_API_KEY", None)
-    if not report.get("success"):
+    validation = _validate_api_key_shape(api_key_value)
+    if api_key_value is not None and not validation["valid"]:
         return {
             "success": False,
-            "error": report.get("error", "unknown"),
-            "hint": report.get("hint", ""),
+            "error": validation["reason"],
+            "hint": (
+                "Frihet API keys are issued at "
+                "https://app.frihet.io/settings/api and look like "
+                "`fri_<alphanumeric_24plus>`."
+            ),
+            "candidate": {"checked": True, "ok": False},
         }
+    # Reachability is a separate question and never carries the
+    # candidate key (or any key). The plugin is not in the auth path;
+    # Hermes's native client is.
+    report = probe_mcp(opener=opener, url=url, timeout=timeout)
+    reachable = bool(report.get("success"))
     server = (report.get("server") or {})
     return {
-        "success": True,
-        "validated": True,
-        "server": server,
+        "success": validation["valid"] or api_key_value is None,
+        "validated": api_key_value is None or validation["valid"],
+        "candidate": {
+            "checked": api_key_value is not None,
+            "ok": validation["valid"] if api_key_value else None,
+            "reason": validation["reason"],
+            # We deliberately do not echo the key. We do not log it. We
+            # never store it.
+        },
+        "current_api_key_present": bool(api_key()),
         "endpoint": report.get("url"),
+        "server": server,
+        "endpoint_reachable": reachable,
         "next_step": (
-            "Persist the API key in your Hermes secret directory and "
-            "add the MCP server block below to your config.yaml:\n"
+            "Authenticate against the canonical MCP using the host:\n"
+            "\n"
+            "  hermes mcp login frihet        # OAuth/PKCE (recommended)\n"
+            "  # or, for unattended callers:\n"
+            "  hermes auth add frihet         # stores FRIHET_API_KEY\n"
+            "\n"
+            "Then add to ~/.hermes/config.yaml:\n"
             "\n"
             "  mcp_servers:\n"
             "    frihet:\n"
             "      url: https://mcp.frihet.io/mcp\n"
-            "      auth: api_key   # or `oauth` if you prefer the OAuth flow\n"
-            "      env:\n"
-            "        FRIHET_API_KEY: ${FRIHET_API_KEY}\n"
+            "      auth: oauth   # OAuth/PKCE browser flow\n"
+            "      # auth: api_key   # if you went the unattended route\n"
+            "\n"
+            "After saving, restart Hermes and run ``/frihet doctor`` — it\n"
+            "will report endpoint_reachable, mcp_configured_in_hermes,\n"
+            "authenticated, and tools_available from the native MCP client."
         ),
     }
+
+
+def _validate_api_key_shape(value: str | None) -> dict[str, Any]:
+    """Local, credential-free shape check for a candidate API key.
+
+    Frihet issues keys with the shape ``fri_<24+ alphanumeric>``. We
+    verify the format locally so we never have to POST a key to a remote
+    endpoint just to learn it was malformed — that would be a
+    credential-in-error-message exposure risk and a layering violation.
+    Returns ``{"valid": bool, "reason": str}``. ``reason`` is empty
+    string when valid.
+    """
+    if value is None or not isinstance(value, str):
+        return {"valid": False, "reason": "no_key_provided"}
+    candidate = value.strip()
+    if not candidate:
+        return {"valid": False, "reason": "empty_key"}
+    if not candidate.startswith("fri_"):
+        return {"valid": False, "reason": "wrong_prefix"}
+    suffix = candidate[4:]
+    if len(suffix) < 24:
+        return {"valid": False, "reason": "too_short"}
+    if not suffix.replace("_", "").isalnum():
+        return {"valid": False, "reason": "illegal_chars"}
+    return {"valid": True, "reason": ""}
 
 
 def to_json(payload: Any) -> str:

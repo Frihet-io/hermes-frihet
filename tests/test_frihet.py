@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -290,16 +291,21 @@ def _ok_response() -> bytes:
 
 
 def test_probe_mcp_success(monkeypatch):
-    monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
+    """The unauthenticated probe must succeed when the MCP server answers
+    200. It carries NO Authorization header — auth evidence flows via
+    ``ctx.call_mcp``, not via this probe."""
+    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     response = FakeResponse(_ok_response(), status=200)
 
     def opener(request, timeout=None):
-        # Sanity-check the request was authorised and used the canonical URL.
-        assert request.headers.get("Authorization") == "Bearer fri_test_12345678"
+        # Sanity-check: NO Authorization header on the reachability probe.
+        assert request.headers.get("Authorization") is None
         return response
 
     result = frihet.probe_mcp(opener=opener)
     assert result["success"] is True
+    assert result["presented_credential"] is False
     assert result["server"]["name"] == "frihet-mcp"
     assert result["server"]["version"] == "1.2.3"
 
@@ -356,50 +362,32 @@ def test_probe_mcp_rejects_malformed_url(monkeypatch):
     assert result["error"] == "malformed_url"
 
 
-def test_doctor_without_api_key_still_runs_probe(monkeypatch, tmp_path):
-    """Doctor is a connectivity probe. Without ``FRIHET_API_KEY``, the probe
-    is sent without an Authorization header. The Frihet MCP may accept the
-    request (demo / unauthenticated discovery in the future) or reject with
-    401 — both are valid outcomes the user needs to see, so we do NOT skip
-    the probe silently.
+def test_doctor_without_ctx_reports_auth_unknown(monkeypatch, tmp_path):
+    """Doctor with no ``ctx`` (CLI / unit-test path) cannot authoritatively
+    prove auth. It must report ``"unknown"`` for both authenticated and
+    tools_available, never a boolean based on a cookie we no longer carry.
 
-    Also: when ``HERMES_HOME/config.yaml`` doesn't carry an
-    ``mcp_servers.frihet`` block, ``mcp_configured_in_hermes`` is
-    ``"unknown"`` — we explicitly refuse to lie by reporting ``False``.
+    The probe still runs (it carries no credentials) so
+    ``endpoint_reachable`` reflects the truth.
     """
-    hermes_home = tmp_path / "no-config-here"
+    hermes_home = tmp_path / "no-ctx"
+    hermes_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
     response = FakeResponse(_ok_response(), status=200)
     result = frihet.doctor(opener=lambda req, t=None, **kw: response)
-    # The four states are exposed explicitly.
     assert "states" in result
     assert result["states"]["endpoint_reachable"] is True
-    # ``mcp_configured_in_hermes`` is tri-state: without a Hermes config
-    # file we can only honestly say "unknown".
     assert result["states"]["mcp_configured_in_hermes"] == "unknown"
-    # Anonymous probe (no Authorization header). The server answered 200
-    # but we did NOT present a credential, so ``authenticated`` must be
-    # False — not True. The previous version conflated those.
-    assert result["states"]["authenticated"] is False
-    # ``tools_available`` parses the serverInfo from the anonymous 200,
-    # so the MCP shape itself is recognisable. That alone is not proof
-    # of authentication; it's just proof the endpoint speaks MCP.
-    assert result["states"]["tools_available"] is True
-    # The umbrella ``ok`` stays False: ``mcp_configured_in_hermes`` is
-    # ``"unknown"`` (a string, not ``True``), so the umbrella cannot flip.
+    assert result["states"]["authenticated"] == "unknown"
+    assert result["states"]["tools_available"] == "unknown"
     assert result["ok"] is False
 
 
-def test_doctor_with_hermes_config_but_no_api_key_marks_authenticated_false(
-    monkeypatch, tmp_path
-):
-    """OAuth-first flow: the MCP block is configured in Hermes config, but
-    there is no API key. ``mcp_configured_in_hermes`` must be ``"configured"``
-    even though ``api_key_configured`` is False. The previous version would
-    have reported ``"configured"`` ONLY when an API key was present — that
-    was a known false negative for OAuth flows.
-    """
+def test_doctor_with_ctx_and_native_ok_reports_auth_true(monkeypatch, tmp_path):
+    """When ctx is provided and ``ctx.call_mcp`` returns ``ok=True``, the
+    doctor authoritatively reports authenticated=True / tools_available=True.
+    This is the OAuth-or-API-key happy path."""
     hermes_home = tmp_path / "hermes-with-config"
     hermes_home.mkdir(parents=True)
     (hermes_home / "config.yaml").write_text(
@@ -407,72 +395,27 @@ def test_doctor_with_hermes_config_but_no_api_key_marks_authenticated_false(
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
 
-    response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
-    assert result["states"]["mcp_configured_in_hermes"] == "configured"
-    # Without an Authorization header, the probe got 200 (demo / OAuth
-    # discovery). ``authenticated`` reflects what the server told us about
-    # the *credential we presented* — we presented none, so this stays False.
-    assert result["states"]["authenticated"] is False
-    assert result["ok"] is False
+    class _Ctx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            return {"ok": True, "result": {"invoices": []}}
 
-
-def test_doctor_with_api_key_marks_authenticated(monkeypatch, tmp_path):
-    monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
-    # Also drop a config block so ``mcp_configured_in_hermes`` is not
-    # ``"unknown"`` (which would block the umbrella ``ok`` independently
-    # of auth).
-    hermes_home = tmp_path / "hermes-with-config-key"
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "mcp_servers:\n  frihet:\n    url: https://mcp.frihet.io/mcp\n",
-        encoding="utf-8",
+    result = frihet.doctor(
+        ctx=_Ctx(),
+        opener=lambda req, t=None, **kw: FakeResponse(_ok_response(), status=200),
     )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    response = FakeResponse(_ok_response(), status=200)
-    captured = {}
-
-    def opener(request, timeout=None):
-        captured["authorization"] = request.headers.get("Authorization", "")
-        return response
-
-    result = frihet.doctor(opener=opener)
-    assert result["ok"] is True
-    assert captured["authorization"] == "Bearer fri_test_12345678"
-    assert result["states"]["endpoint_reachable"] is True
-    assert result["states"]["mcp_configured_in_hermes"] == "configured"
     assert result["states"]["authenticated"] is True
     assert result["states"]["tools_available"] is True
-
-
-def test_doctor_distinguishes_reachable_from_authenticated(monkeypatch, tmp_path):
-    """An anonymous 200 is reachable but NOT authenticated. We must not
-    flip the ``ok`` flag to True just because the server answered."""
-    hermes_home = tmp_path / "hermes-anon"
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "mcp_servers:\n  frihet:\n    url: https://mcp.frihet.io/mcp\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
-    response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     assert result["states"]["endpoint_reachable"] is True
     assert result["states"]["mcp_configured_in_hermes"] == "configured"
-    # Server returned 200 but we sent no credential → not authenticated.
-    assert result["states"]["authenticated"] is False
-    assert result["ok"] is False
-    assert result["probe"]["success"] is True  # the probe ran fine
+    assert result["ok"] is True
 
 
-def test_doctor_reports_unauthorized_state(monkeypatch, tmp_path):
-    """When the server returns 401, ``endpoint_reachable`` stays True but
-    ``authenticated`` and ``tools_available`` are False."""
-    monkeypatch.setenv("FRIHET_API_KEY", "fri_wrong_12345678")
-    hermes_home = tmp_path / "hermes-401"
+def test_doctor_with_ctx_and_native_failure_reports_auth_false(monkeypatch, tmp_path):
+    """When the native MCP call fails (server reachable but auth broken),
+    authenticated=False / tools_available=False. The endpoint_reachable
+    stays True (we still ran the unauthenticated probe)."""
+    hermes_home = tmp_path / "hermes-broken-auth"
     hermes_home.mkdir(parents=True)
     (hermes_home / "config.yaml").write_text(
         "mcp_servers:\n  frihet:\n    url: https://mcp.frihet.io/mcp\n",
@@ -480,68 +423,87 @@ def test_doctor_reports_unauthorized_state(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
+    class _Ctx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            return {"ok": False, "error": "auth_expired"}
+
+    result = frihet.doctor(
+        ctx=_Ctx(),
+        opener=lambda req, t=None, **kw: FakeResponse(_ok_response(), status=200),
+    )
+    assert result["states"]["authenticated"] is False
+    assert result["states"]["tools_available"] is False
+    assert result["states"]["endpoint_reachable"] is True
+    assert result["ok"] is False
+
+
+def test_doctor_reports_unauthorized_state_with_ctx(monkeypatch, tmp_path):
+    """When the unauthenticated probe gets HTTP 401, the probe reports
+    mcp_unauthorized and the doctor states reflect that."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-401"))
+    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+
+    class _Ctx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            return {"ok": False, "error": "auth_required"}
+
     def opener(request, timeout=None):
-        raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
+        raise frihet.urllib.error.HTTPError(
             request.full_url, 401, "Unauthorized", {}, None
         )
 
-    result = frihet.doctor(opener=opener)
+    result = frihet.doctor(ctx=_Ctx(), opener=opener)
     assert result["states"]["endpoint_reachable"] is True
     assert result["states"]["authenticated"] is False
-    assert result["ok"] is False
     assert result["probe"]["error"] == "mcp_unauthorized"
-
-
-def test_doctor_ok_false_when_state_is_unknown(monkeypatch, tmp_path):
-    """The umbrella ``ok`` must NOT flip True when any state is ``"unknown"``,
-    even if all the other states are True. This is the core epistemological
-    contract of the doctor: reachability != configured != authenticated != ready.
-    """
-    hermes_home = tmp_path / "hermes-unk"
-    hermes_home.mkdir(parents=True)
-    # NO config.yaml — mcp_configured_in_hermes will be "unknown"
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setenv("FRIHET_API_KEY", "fri_anything_12345678")
-    response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
-    assert result["states"]["mcp_configured_in_hermes"] == "unknown"
-    assert result["states"]["authenticated"] is True
-    assert result["ok"] is False, "unknown state must keep umbrella false"
-
-
-def test_doctor_oauth_flow_with_token_storage_present(monkeypatch, tmp_path):
-    """OAuth-first flow: the user has completed ``hermes mcp login frihet`` and
-    Hermes has cached an OAuth token for the frihet MCP. The plugin CANNOT
-    verify that from its public surface (the OAuth token lives in Hermes's
-    ``HermesTokenStorage``, not in the plugin), but it CAN see the
-    ``mcp_servers.frihet`` block in config.yaml. So:
-
-      - mcp_configured_in_hermes = "configured"  (the block exists)
-      - authenticated = False or "unknown"        (we did not present a key)
-
-    The plugin refuses to lie about authentication. The user can still get
-    real auth from the Hermes native MCP client.
-    """
-    hermes_home = tmp_path / "hermes-oauth"
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "mcp_servers:\n"
-        "  frihet:\n"
-        "    url: https://mcp.frihet.io/mcp\n"
-        "    auth:\n"
-        "      type: oauth\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
-
-    response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
-    assert result["states"]["mcp_configured_in_hermes"] == "configured"
-    # Anonymous probe, even when server replies 200: we did not present
-    # any credential. ``authenticated`` stays False.
-    assert result["states"]["authenticated"] is False
     assert result["ok"] is False
+
+
+def test_doctor_allowlist_missing_is_distinct_state(monkeypatch, tmp_path):
+    """When the plugin has not been granted ``mcp_allowlist``, the doctor
+    surfaces ``"allowlist_not_granted"`` instead of conflating it with
+    auth failure. Users can fix this in config.yaml without touching OAuth."""
+    hermes_home = tmp_path / "hermes-allowlist-missing"
+    hermes_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    class _Ctx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            raise PermissionError(
+                "Plugin 'frihet' is not allowed to call MCP server 'frihet'. "
+                "Add it to plugins.entries.frihet.mcp_allowlist in config.yaml."
+            )
+
+    result = frihet.doctor(
+        ctx=_Ctx(),
+        opener=lambda req, t=None, **kw: FakeResponse(_ok_response(), status=200),
+    )
+    assert result["states"]["authenticated"] == "allowlist_not_granted"
+    assert result["states"]["tools_available"] == "allowlist_not_granted"
+    assert result["ok"] is False
+    # The evidence envelope carries the explanation so the user knows
+    # what to fix.
+    assert result["auth_evidence"]["error"] == "mcp_allowlist_missing"
+
+
+def test_doctor_probe_carries_no_authorization_even_with_api_key(monkeypatch, tmp_path):
+    """The unauthenticated probe must NEVER carry Authorization — even when
+    FRIHET_API_KEY is set. The probe is reachability-only; auth evidence
+    flows through ctx.call_mcp."""
+    monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "no-config-here"))
+    captured = {}
+
+    def opener(request, timeout=None, **kw):
+        captured["authorization"] = request.headers.get("Authorization")
+        return FakeResponse(_ok_response(), status=200)
+
+    frihet.doctor(opener=opener)
+    assert captured["authorization"] is None, (
+        "probe_mcp leaked an Authorization header"
+    )
+
+
 
 
 def test_mcp_server_block_tri_state_for_corrupt_config(monkeypatch, tmp_path):
@@ -593,38 +555,77 @@ def test_status_reports_no_secrets():
 
 
 def test_setup_restores_previous_env(monkeypatch):
+    """``/frihet setup <key>`` does NOT inject the candidate into the env.
+    The plugin no longer sends credentials to the canonical MCP — it only
+    validates the candidate's shape locally. This test asserts:
+
+      * shape-valid candidates report ``candidate.ok=True``;
+      * no Authorization header ever leaves the process;
+      * the host's env is untouched (no FRIHET_API_KEY injection).
+    """
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
 
+    captured = {}
+
     def opener(request, timeout=None):
-        # The candidate key was used in the request, and it should NOT leak
-        # into the persisted env after setup() returns.
-        assert "Bearer fri_candidate_12345678" in request.headers.get("Authorization", "")
+        captured["authorization"] = request.headers.get("Authorization")
         return FakeResponse(_ok_response(), status=200)
 
-    report = frihet.setup(api_key_value="fri_candidate_12345678", opener=opener)
+    report = frihet.setup(
+        api_key_value="fri_candidate_1234567890abcdef", opener=opener
+    )
     assert report["success"] is True
-    # The candidate must be gone from the environment after setup().
-    assert "fri_candidate_12345678" not in (frihet.api_key() or "")
+    assert report["candidate"]["ok"] is True
+    # No Authorization header was sent — the plugin is not in the
+    # credential path.
+    assert captured["authorization"] is None
+    # The env was never touched.
+    assert "FRIHET_API_KEY" not in os.environ
 
 
 def test_setup_with_no_key_validates_current(monkeypatch):
+    """When no candidate is provided, ``setup`` only reports on the
+    configured key and runs an unauthenticated reachability probe.
+    It does NOT POST the configured key to the endpoint (that path
+    was removed because it was an architectural and epistemological
+    mistake)."""
     monkeypatch.setenv("FRIHET_API_KEY", "fri_existing_12345678")
-    response = FakeResponse(_ok_response(), status=200)
-    report = frihet.setup(opener=lambda req, t=None, **kw: response)
+    captured = {}
+
+    def opener(request, timeout=None):
+        captured["authorization"] = request.headers.get("Authorization")
+        return FakeResponse(_ok_response(), status=200)
+
+    report = frihet.setup(opener=opener)
+    assert captured["authorization"] is None
     assert report["success"] is True
+    assert report["current_api_key_present"] is True
+
+
+def test_setup_reports_failure_on_invalid_candidate(monkeypatch):
+    """A malformed candidate (wrong prefix, too short, illegal chars)
+    is rejected by the local shape check — without ever touching
+    the network."""
+    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+    report = frihet.setup(api_key_value="not_a_real_key")
+    assert report["success"] is False
+    assert report["error"] == "wrong_prefix"
 
 
 def test_setup_reports_failure_on_unauthorised(monkeypatch):
+    """If the unauthenticated reachability probe returns 401, setup
+    reports ``endpoint_reachable=False`` and the user is told to
+    authenticate via the host's canonical flow (``hermes mcp login``)."""
     monkeypatch.setenv("FRIHET_API_KEY", "fri_existing_12345678")
 
     def opener(request, timeout=None):
-        raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
+        raise frihet.urllib.error.HTTPError(
             request.full_url, 401, "Unauthorized", {}, None
         )
 
     report = frihet.setup(opener=opener)
-    assert report["success"] is False
-    assert report["error"] == "mcp_unauthorized"
+    assert report["endpoint_reachable"] is False
+    assert "hermes mcp login" in report["next_step"]
 
 
 # ─── Plugin registration (smoke) ────────────────────────────────────────────
@@ -812,101 +813,3 @@ def test_mcp_config_dict_auth_shape_is_silent_misconfiguration(
     # But it should log a warning so an attentive one sees it.
     # (We accept either: the warning was emitted, or it was not. The important
     # contract is that the plugin doesn't LIE by reporting "missing" here.)
-
-
-# ─── OAuth token cache (Hermes writes to ~/.hermes/mcp-tokens/<name>.json) ──
-# The doctor should be able to verify an MCP server even when the only
-# credential is the OAuth token Hermes itself cached — not just when
-# FRIHET_API_KEY is set. This lets ``authenticated`` flip True in an
-# OAuth-first install where no env var exists at all.
-
-
-def test_cached_oauth_token_returns_none_when_missing(monkeypatch, tmp_path):
-    """No ``$HERMES_HOME/mcp-tokens/<name>.json`` -> ``None`` (treat like
-    no credential). The doctor must not invent auth."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty"))
-    assert frihet.cached_oauth_token("frihet") is None
-
-
-def test_cached_oauth_token_returns_access_token(monkeypatch, tmp_path):
-    home = tmp_path / "hermes-oauth-cache"
-    home.mkdir(parents=True)
-    tokens = home / "mcp-tokens"
-    tokens.mkdir()
-    # Match the live Hermes cache schema (``expires_at`` is a Unix
-    # timestamp; we set it far in the future so it stays valid).
-    import time as _t
-    tokens.joinpath("frihet.json").write_text(
-        '{"access_token": "fri_oauth_demo_abc123def456ghi789",'
-        ' "token_type": "Bearer",'
-        ' "expires_at": %d,'
-        ' "scope": "read write"}' % int(_t.time() + 3600),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    assert frihet.cached_oauth_token("frihet") == "fri_oauth_demo_abc123def456ghi789"
-
-
-def test_cached_oauth_token_returns_none_for_expired(monkeypatch, tmp_path):
-    """Expired token is treated as no token — doctor must not flip True
-    on a stale credential."""
-    home = tmp_path / "hermes-stale"
-    home.mkdir(parents=True)
-    tokens = home / "mcp-tokens"
-    tokens.mkdir()
-    tokens.joinpath("frihet.json").write_text(
-        '{"access_token": "fri_old", "expires_at": 1}',  # epoch 1 = expired
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    assert frihet.cached_oauth_token("frihet") is None
-
-
-def test_cached_oauth_token_returns_none_for_malformed(monkeypatch, tmp_path):
-    home = tmp_path / "hermes-junk"
-    home.mkdir(parents=True)
-    tokens = home / "mcp-tokens"
-    tokens.mkdir()
-    tokens.joinpath("frihet.json").write_text("{ this is not valid json", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    assert frihet.cached_oauth_token("frihet") is None
-
-
-def test_probe_uses_oauth_token_when_no_api_key(monkeypatch, tmp_path):
-    """With OAuth cache present and no API key, ``probe_mcp`` sends
-    Authorization: Bearer <oauth>. We verify the header was set and that
-    the probe returns ``presented_credential=True``."""
-    import time as _t
-    home = tmp_path / "hermes-oauth-real"
-    home.mkdir(parents=True)
-    (home / "mcp-tokens").mkdir()
-    (home / "mcp-tokens" / "frihet.json").write_text(
-        '{"access_token": "fri_oauth_test_xyz12345",'
-        ' "expires_at": %d}' % int(_t.time() + 3600),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
-
-    captured = {}
-    def opener(request, timeout=None, **kw):
-        captured["authorization"] = request.headers.get("Authorization", "")
-        captured["user_agent"] = request.headers.get("User-Agent", "")
-        # Return a valid MCP initialize response
-        body = (
-            b'data: {"jsonrpc":"2.0","id":1,"result":{'
-            b'"protocolVersion":"2025-06-18",'
-            b'"serverInfo":{"name":"frihet-mcp","version":"1.16.6"}}}\n\n'
-        )
-        return type('FakeResp', (), {
-            'read': lambda self: body,
-            'status': 200,
-            '__enter__': lambda self: self,
-            '__exit__': lambda self, *a: None,
-        })()
-
-    result = frihet.probe_mcp(opener=opener)
-    assert captured["authorization"] == "Bearer fri_oauth_test_xyz12345"
-    assert result["presented_credential"] is True
-    assert result["success"] is True
-    assert result["server"]["name"] == "frihet-mcp"

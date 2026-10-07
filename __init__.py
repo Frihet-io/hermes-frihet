@@ -50,50 +50,67 @@ def _pre_tool_call(tool_name: str = "", **_: Any) -> dict[str, Any] | None:
     return _frihet.pre_tool_call_gate(operation)
 
 
-def _command(raw_args: str) -> str:
-    """Slash-command handler for ``/frihet <status|setup|doctor>``.
+def _make_command(ctx: Any):
+    """Build the ``/frihet`` slash-command handler bound to this plugin's
+    live ``PluginContext``.
 
-    Returns a JSON string. Failures carry an ``error`` code so the user
-    (and the host adapter) can branch on it. Secrets are never echoed.
+    Binding via closure is the documented pattern: ``register_command``
+    takes a handler with signature ``(raw_args: str) -> str | None``,
+    but the handler needs the ``ctx`` to authoritatively call
+    ``ctx.call_mcp`` from inside ``/frihet doctor``. We capture the
+    outer ``ctx`` here at registration time.
+
+    The bound function is the only way to authoritatively verify
+    authentication against the canonical Frihet MCP: ``ctx.call_mcp``
+    uses Hermes's own native MCP client (with its OAuth cache, breaker,
+    and reconnect) — the plugin itself never reads tokens.
     """
-    parts = raw_args.strip().split()
-    action = parts[0].lower() if parts else "status"
-    if action == "status":
-        result = _frihet.status()
-    elif action == "setup":
-        # Two layouts supported:
-        #   /frihet setup                  -> validate the currently configured key.
-        #   /frihet setup <api_key_value>  -> validate a candidate pasted in-chat
-        #                                    (NOT recommended — the key then lives
-        #                                    in the transcript. Prefer /frihet
-        #                                    status -> heres auth path.)
-        candidate = parts[1] if len(parts) > 1 else None
-        result = _frihet.setup(api_key_value=candidate)
-    elif action == "doctor":
-        result = _frihet.doctor()
-    elif action in {"help", "--help", "-h"}:
-        result = {
-            "success": True,
-            "usage": "/frihet <status|setup|doctor>",
-            "subcommands": {
-                "status": "Show local plugin config (no network).",
-                "setup": "Validate FRIHET_API_KEY and print the MCP server block.",
-                "doctor": (
-                    "Live MCP probe — reports endpoint_reachable, "
-                    "mcp_configured_in_hermes, authenticated, and "
-                    "tools_available as tri-state (true / false / "
-                    "unknown). Never a single 'connected' flag."
-                ),
-            },
-        }
-    else:
-        result = {
-            "success": False,
-            "error": "unknown_subcommand",
-            "subcommand": action,
-            "usage": "/frihet <status|setup|doctor>",
-        }
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    def _command(raw_args: str) -> str:
+        parts = raw_args.strip().split()
+        action = parts[0].lower() if parts else "status"
+        if action == "status":
+            result = _frihet.status()
+        elif action == "setup":
+            # Two layouts supported:
+            #   /frihet setup                  -> validate the currently configured key.
+            #   /frihet setup <api_key_value>  -> validate a candidate pasted in-chat
+            #                                    (NOT recommended — the key then lives
+            #                                    in the transcript. Prefer /frihet
+            #                                    status -> Hermes native auth path.)
+            candidate = parts[1] if len(parts) > 1 else None
+            result = _frihet.setup(api_key_value=candidate)
+        elif action == "doctor":
+            # Pass ctx so the doctor can authoritatively verify auth via
+            # ``ctx.call_mcp``. Without ctx, doctor() reports
+            # authenticated="unknown" / tools_available="unknown" and
+            # tells the user to run from inside Hermes.
+            result = _frihet.doctor(ctx=ctx)
+        elif action in {"help", "--help", "-h"}:
+            result = {
+                "success": True,
+                "usage": "/frihet <status|setup|doctor>",
+                "subcommands": {
+                    "status": "Show local plugin config (no network).",
+                    "setup": "Validate FRIHET_API_KEY and print the MCP server block.",
+                    "doctor": (
+                        "Live MCP probe — reports endpoint_reachable, "
+                        "mcp_configured_in_hermes, authenticated, and "
+                        "tools_available as tri-state (true / false / "
+                        "unknown / allowlist_not_granted). Auth and tools "
+                        "evidence comes from Hermes's native MCP client, "
+                        "never from the plugin reading tokens."
+                    ),
+                },
+            }
+        else:
+            result = {
+                "success": False,
+                "error": "unknown_subcommand",
+                "subcommand": action,
+                "usage": "/frihet <status|setup|doctor>",
+            }
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    return _command
 
 
 def register(ctx: Any) -> None:
@@ -113,12 +130,11 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
 
     # ── Slash command: /frihet ─────────────────────────────────────────────
-    # Plugins can register either a slash command (``/frihet``) or a CLI
-    # subcommand (``hermes frihet``). The slash form is the one users
-    # discover in-chat, so we register that.
+    # Bind ctx via closure so the doctor subcommand can authoritatively
+    # verify authentication through ``ctx.call_mcp``.
     ctx.register_command(
         "frihet",
-        _command,
+        _make_command(ctx),
         description="Frihet integration: status, setup, doctor.",
         args_hint="<status|setup|doctor>",
     )
