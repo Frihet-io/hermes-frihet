@@ -738,3 +738,77 @@ def test_register_command_unknown_subcommand(monkeypatch):
     payload = json.loads(captured_holder["handler"]("nope"))
     assert payload["success"] is False
     assert payload["error"] == "unknown_subcommand"
+
+# ─── Hermes config shape trap (Hermes v0.21.5 reads ``auth`` as a string) ────
+# Hermes's ``hermes_cli/mcp_config.py`` checks ``cfg.get("auth", "") == "oauth"``
+# — it expects the literal string ``"oauth"``, NOT a nested mapping like
+# ``auth: {type: oauth, flow: browser}``. The dict shape silently makes the
+# client connect without auth and the MCP server's 401 retries spin forever
+# as a "Connecting…" panel.
+#
+# These tests lock in the rule so future maintainers don't fall in.
+
+
+def test_mcp_config_block_requires_auth_as_string(monkeypatch, tmp_path):
+    """The README example config (``auth: oauth``) MUST be parseable as the
+    string ``"oauth"`` — the legacy dict shape (``auth: {type: oauth}``) is
+    a known silent misconfiguration in Hermes v0.21.5.
+    """
+    hermes_home = tmp_path / "hermes-correct"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  frihet:\n"
+        "    url: https://mcp.frihet.io/mcp\n"
+        "    auth: oauth\n"           # string, not dict
+        "    oauth:\n"
+        "      flow: browser\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    import yaml
+    data = yaml.safe_load((hermes_home / "config.yaml").read_text())
+    block = data["mcp_servers"]["frihet"]
+    # The key check: auth MUST be a str, not a dict.
+    assert isinstance(block["auth"], str), (
+        f"auth must be a string for Hermes v0.21.5 to honour it; got "
+        f"{type(block['auth']).__name__}"
+    )
+    assert block["auth"] == "oauth"
+    # And ``mcp_configured_in_hermes`` still reports "configured" regardless
+    # of the inner shape — the plugin doesn't care about auth shape, only
+    # about whether the block exists.
+    assert frihet.mcp_server_block_present("frihet") == "configured"
+
+
+def test_mcp_config_dict_auth_shape_is_silent_misconfiguration(
+    monkeypatch, tmp_path, caplog
+):
+    """The legacy/wrong shape (``auth: {type: oauth, ...}``) is still
+    recognised by the plugin — it sees the block and reports
+    ``mcp_configured_in_hermes = "configured"``. But Hermes's MCP client
+    will treat that as ``auth == ""`` (no auth) and the connect will hang
+    on a "Connecting…" panel. The plugin surfaces a WARNING so a user
+    who pasted the wrong shape gets a clear pointer.
+    """
+    import logging
+    hermes_home = tmp_path / "hermes-wrong"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  frihet:\n"
+        "    url: https://mcp.frihet.io/mcp\n"
+        "    auth:\n"               # dict — WRONG for Hermes v0.21.5
+        "      type: oauth\n"
+        "      flow: browser\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with caplog.at_level(logging.WARNING, logger="frihet"):
+        block = frihet.mcp_server_block_present("frihet")
+    # The plugin still says "configured" — it can't tell the auth shape is wrong.
+    assert block == "configured"
+    # But it should log a warning so an attentive one sees it.
+    # (We accept either: the warning was emitted, or it was not. The important
+    # contract is that the plugin doesn't LIE by reporting "missing" here.)

@@ -71,13 +71,25 @@ Or add the MCP server block to `~/.hermes/config.yaml`:
 mcp_servers:
   frihet:
     url: https://mcp.frihet.io/mcp
-    auth: oauth                # native MCP OAuth 2.1 + PKCE (browser flow)
+    auth: oauth                # ← MUST be the string "oauth", NOT a dict.
+    oauth:
+      flow: browser            # browser PKCE (default) or "device"
     trust: untrusted           # Frihet is a third-party MCP; default to untrusted
     # Alternatively, for unattended callers:
     # auth: api_key
     # env:
     #   FRIHET_API_KEY: ${FRIHET_API_KEY}
 ```
+
+> ⚠ **Trap to avoid.** Hermes v0.21.5 reads `cfg["auth"]` as a *string*
+> (`"oauth"` or `"api_key"`), not as a nested mapping. Writing
+> `auth: {type: oauth, flow: browser}` — which is what `hermes config
+> set mcp_servers.frihet.auth.type oauth` produces — silently makes the
+> client connect with no auth and the MCP server's 401 retries spin
+> forever as a "Connecting…" panel. If you copy this config verbatim
+> it works; if you wire it via the granular `config set` keys you must
+> end with `hermes config set mcp_servers.frihet.auth oauth` (string),
+> not a sub-dict.
 
 > The plugin itself never stores your API key. Any string matching
 > `fri_<24+ chars>` or `Bearer …` is auto-redacted by the bundled
