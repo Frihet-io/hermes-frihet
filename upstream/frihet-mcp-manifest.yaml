@@ -48,8 +48,9 @@ suggest:
     - frihet
     - invoice
     - invoices
+    - expense
     - expenses
-    - expenses
+    - quote
     - quotes
     - accounting
     - erp

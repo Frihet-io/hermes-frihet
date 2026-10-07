@@ -1,56 +1,39 @@
-# Hermes plugin-catalog candidate for hermes-frihet.
+# Hermes plugin-catalog entry for hermes-frihet v0.1.0.
 #
-# This file is a CANDIDATE for a future PR to:
-#     NousResearch/hermes-agent/plugin-catalog/frihet.yaml
-#
-# Per the catalog rules (``plugin-catalog/README.md``):
-# - The maintainer of the plugin repository (``Frihet-io`` here) is the only
-#   one authorised to submit the entry.
-# - ``tier`` MUST be ``community`` — ``official`` in the catalogue means
+# Catalog: NousResearch/hermes-agent/plugin-catalog/frihet.yaml
+# Per the catalog rules (plugin-catalog/README.md):
+# - The maintainer of the plugin repository (Frihet-io) is the only one
+#   authorised to submit the entry.
+# - ``tier`` MUST be ``community`` — ``official`` in the catalog means
 #   "maintained by NousResearch". We describe ourselves as the "Official
-#   Hermes Agent integration for Frihet" in the description and README; the
-#   catalogue's tier label is a Nous-internal trust signal, not a brand
-#   claim.
+#   Hermes Agent integration for Frihet" in the description, not in the
+#   catalog's tier label.
 # - The SHA must be a 40-character full commit hash of a tagged, audited
-#   commit of ``Frihet-io/hermes-frihet``. Update via a new PR whenever we
+#   commit of Frihet-io/hermes-frihet. Update via a new PR whenever we
 #   ship a meaningful change (rule 4 of the catalog admission policy).
-#
-# Do NOT open this PR until the plugin has been dogfooded in a real Hermes
-# install (Phase E in our internal roadmap).
 name: frihet
 repo: https://github.com/Frihet-io/hermes-frihet
-# sha: <40-hex commit sha — filled in at PR time>
-subdir: ""
+# Pinned SHA — Frihet-io/hermes-frihet @ v0.1.0 (feat(doctor): honour
+# the Hermes OAuth token cache when no API key is set). 75 tests green,
+# hermes plugins validate --install-deps 15/15, security scan safe.
+sha: f3312087a8acda01ee3a5b089017f2a2657d2d5c
 description: "Official Hermes Agent integration for Frihet — discoverability, setup, diagnostics, and operating guidance for the Frihet MCP. Zero duplicated tools; the canonical 158-operation Frihet surface stays in @frihet/mcp-server and the remote endpoint https://mcp.frihet.io/mcp."
 maintainer: Frihet-io
 tier: community
 category: tools
-# docs_url points at our README so the catalog card has a stable landing.
 docs_url: https://github.com/Frihet-io/hermes-frihet#readme
-# requires_hermes mirrors plugin.yaml. The catalog server validates this on
-# load; the floor matches the plugin's own declared floor.
 requires_hermes: ">=0.21.5"
-# version is a human-readable label for the pinned commit. Bump in the
-# same PR that bumps ``sha`` so the card label matches the code.
-# version: "0.1.0"
-# image and screenshots are optional. Per the catalog rules they MUST live
-# on raw.githubusercontent.com / *.githubusercontent.com, pin to the same
-# commit SHA, and be on a 2:1 aspect ratio. Leave these unset for v0.1
-# until we have something better than a placeholder.
-# image: "https://raw.githubusercontent.com/Frihet-io/hermes-frihet/<sha>/docs/banner.png"
-# screenshots: []
-# readme is on by default; the README at the pinned SHA renders on the
-# catalog card and on /docs/plugins/<name>.
-readme: true
-platforms: []
-title: "Frihet"
-onboarding: false
-known_issues: []
+version: "0.1.0"
+# Capabilities mirror plugin.yaml exactly.
+# Provides zero Python tools on purpose: the canonical Frihet surface
+# (158 operations) lives in @frihet/mcp-server and is reached via the
+# native Hermes MCP client. The plugin adds:
+#   - a skill (skills/frihet/SKILL.md) that encodes the operating contract
+#   - a pre_tool_call hook that escalates irreversible Frihet operations
+#     to the human approval gate
+#   - a /frihet slash command for setup/status/doctor
 capabilities:
   provides_tools: []
-  # The plugin attaches a single hook that escalates irreversible Frihet
-  # MCP operations to Hermes's human approval gate. The hook follows the
-  # documented ``pre_tool_call`` directive contract (action: approve).
   provides_hooks:
     - pre_tool_call
   provides_middleware: []
