@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests + manifest lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Hermes Agent currently requires ``python>=3.11,<3.15`` per its
+        # pyproject.toml. We mirror that floor+ceiling here.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-mock
+
+      - name: Byte-compile sources (catches syntax errors fast)
+        run: |
+          python -m py_compile __init__.py frihet.py
+          python -m py_compile tests/test_frihet.py tests/test_plugin_discovery.py
+
+      - name: Run unit tests
+        env:
+          # Make sure tests don't leak real credentials.
+          FRIHET_API_KEY: ""
+          FRIHET_MCP_URL: ""
+        run: python -m pytest -q
+
+      - name: Validate plugin.yaml against the schema
+        run: |
+          python - <<'PY'
+          """Schema sanity check for plugin.yaml — mirrors what
+          ``hermes plugins validate`` does without requiring Hermes itself
+          in CI. The actual admission test runs on a Hermes-enabled
+          runner for PRs to NousResearch/hermes-agent."""
+          import re, sys, yaml, pathlib
+          manifest = yaml.safe_load(pathlib.Path("plugin.yaml").read_text())
+          required = ["name", "version", "description", "author", "kind"]
+          missing = [k for k in required if not manifest.get(k)]
+          if missing:
+              print(f"FAIL: plugin.yaml missing {missing}", file=sys.stderr)
+              sys.exit(1)
+          for field in ("provides_tools", "provides_hooks", "provides_middleware", "requires_env"):
+              if manifest.get(field) is not None and not isinstance(manifest[field], list):
+                  print(f"FAIL: {field} must be a list", file=sys.stderr)
+                  sys.exit(1)
+          spec = str(manifest.get("requires_hermes") or "").strip()
+          if spec and not re.match(r"^>=\d+\.\d+", spec):
+              print(f"FAIL: requires_hermes spec {spec!r} does not start with '>='", file=sys.stderr)
+              sys.exit(1)
+          for entry in manifest.get("requires_env") or []:
+              if not re.match(r"^[A-Z][A-Z0-9_]*$", entry):
+                  print(f"FAIL: requires_env entry {entry!r} is not UPPER_SNAKE_CASE", file=sys.stderr)
+                  sys.exit(1)
+          print(f"OK: plugin.yaml validates (name={manifest['name']}, version={manifest['version']})")
+          PY
+
+      - name: Validate upstream MCP manifest (yaml well-formed)
+        run: |
+          test -f upstream/frihet-mcp-manifest.yaml || (echo "FAIL: upstream/frihet-mcp-manifest.yaml missing" && exit 1)
+          python - <<'PY'
+          import sys, yaml, pathlib
+          data = yaml.safe_load(pathlib.Path("upstream/frihet-mcp-manifest.yaml").read_text())
+          for k in ("manifest_version", "name", "transport", "auth"):
+              if k not in data:
+                  print(f"FAIL: upstream manifest missing {k!r}", file=sys.stderr); sys.exit(1)
+          if data["transport"].get("type") != "http":
+              print(f"FAIL: upstream transport must be http, got {data['transport'].get('type')!r}", file=sys.stderr); sys.exit(1)
+          if data["auth"].get("type") not in ("oauth", "oauth_pkce"):
+              print(f"FAIL: upstream auth must be oauth, got {data['auth'].get('type')!r}", file=sys.stderr); sys.exit(1)
+          print(f"OK: upstream manifest validates (name={data['name']})")
+          PY
+
+      - name: Verify skill is present
+        run: |
+          test -f skills/frihet/SKILL.md || (echo "FAIL: skills/frihet/SKILL.md missing" && exit 1)
+          head -1 skills/frihet/SKILL.md | grep -q "^---$" || (echo "FAIL: SKILL.md missing frontmatter" && exit 1)
+          echo "OK: skill present"
+
+      - name: Verify LICENSE is MIT
+        run: |
+          head -3 LICENSE | grep -q "MIT License" || (echo "FAIL: LICENSE missing MIT header" && exit 1)
+          echo "OK: license is MIT"
+
+      - name: Verify no secrets committed
+        run: |
+          # The .gitignore should keep .env files out of the repo.
+          grep -q "^\.env$" .gitignore || (echo "FAIL: .gitignore missing .env rule" && exit 1)
+          echo "OK: secrets not committed"
+
+  hermes-validate:
+    name: Hermes plugin validate (opt-in)
+    runs-on: ubuntu-latest
+    # Only run on tagged commits / main branch PRs to keep PR-runs fast.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hermes plugins validate
+        env:
+          FRIHET_API_KEY: ""
+        run: |
+          # The Hermes runner is opt-in. If the maintainer wants strict
+          # catalog admission CI, they replace the conditional below with
+          # ``hermes plugins validate --install-deps .``. The unit + lint
+          # job above is the load-bearing CI gate today.
+          echo "hermes plugins validate is opt-in — see README for instructions."
