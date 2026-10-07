@@ -47,10 +47,13 @@ account with audit trails:
 1. **Read before write.** Before creating, updating, sending, marking paid,
    deleting, or filing anything, call the matching `*get` or `*list` tool to
    confirm the target exists and the parameters match.
-2. **Draft first.** `createInvoice`, `createQuote`, `createCreditNote`,
-   `createPayment`, and similar default to `status: "draft"` on the Frihet
-   side. Build the draft, show the totals, and hand the decision back. Do
-   **not** auto-send from inside an autonomous loop.
+2. **Draft first (only when the operation supports drafts).** `createInvoice`,
+   `createQuote`, `createCreditNote`, and similar default to
+   `status: "draft"` on the Frihet side. Build the draft, show the totals,
+   and hand the decision back. Do **not** auto-send from inside an
+   autonomous loop. **Note:** `createPayment` does NOT have a draft
+   status — it is classified as **irreversible** by the plugin and
+   always escalates to human approval via the `pre_tool_call` hook.
 3. **Honour `Idempotency-Key`.** Frihet's write operations accept an
    `Idempotency-Key`. If you are retrying after a network blip, reuse the
    same key. If you are re-running for a different business reason,
@@ -62,9 +65,14 @@ account with audit trails:
    retry without checking is how double charges happen.
 6. **No secrets in the model context.** API keys, OAuth bearer tokens,
    `Authorization` headers, and any string matching `fri_<24+ chars>` are
-   auto-redacted by this plugin's `pre_tool_call` hook. If you find
-   yourself about to send one, stop — write to the Hermes secret directory
-   instead.
+   redacted by this plugin's helper functions (`status()`, `setup()`,
+   `doctor()`, and the `redact()` utility) before they ever appear in
+   the model's working context or in slash-command output. The
+   `pre_tool_call` hook does NOT redact — it only classifies and
+   escalates. If you find yourself about to send a credential in
+   conversation, stop — write to the Hermes secret directory instead
+   (`hermes auth add frihet`) and use OAuth/PKCE (`hermes mcp login
+   frihet`) when possible.
 7. **Frihet is the authority for workspace, scopes, roles, and resources.**
    Do not invent rows in your own memory that contradict what the MCP
    says. If a record is not returned by `*get`/`*list`, it does not exist

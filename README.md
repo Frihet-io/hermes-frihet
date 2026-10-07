@@ -144,8 +144,11 @@ The full version lives in [`skills/frihet/SKILL.md`](skills/frihet/SKILL.md).
 The non-negotiables:
 
 - **Read before write.** Confirm the target exists before mutating it.
-- **Draft first.** `createInvoice`, `createQuote`, `createCreditNote`,
-  `createPayment` default to `status: "draft"`. Show totals, hand back.
+- **Draft first (when the operation supports drafts).** `createInvoice`,
+  `createQuote`, `createCreditNote` default to `status: "draft"`. Show
+  totals, hand back. **`createPayment` is NOT draft-capable** — it is
+  classified as **irreversible** by the plugin's `pre_tool_call` hook
+  and always escalates to human approval before it lands.
 - **Honour `Idempotency-Key`.** Reuse on retry-with-same-intent;
   generate a new one for a different business reason. Never retry blindly.
 - **Reconcile before retry on ambiguity.** If a write returned
