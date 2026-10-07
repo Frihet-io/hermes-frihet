@@ -293,7 +293,7 @@ def test_probe_mcp_success(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
     response = FakeResponse(_ok_response(), status=200)
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         # Sanity-check the request was authorised and used the canonical URL.
         assert request.headers.get("Authorization") == "Bearer fri_test_12345678"
         return response
@@ -311,7 +311,7 @@ def test_probe_mcp_handles_sse_response(monkeypatch):
         b"data: " + _json_response({"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "sse", "version": "0.1"}}}).decode().encode() + b"\n\n"
     )
     response = FakeResponse(body, status=200)
-    result = frihet.probe_mcp(opener=lambda req, t: response)
+    result = frihet.probe_mcp(opener=lambda req, t=None, **kw: response)
     assert result["success"] is True
     assert result["server"]["name"] == "sse"
 
@@ -319,7 +319,7 @@ def test_probe_mcp_handles_sse_response(monkeypatch):
 def test_probe_mcp_unauthorised(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_wrong_key_12345")
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
             request.full_url, 401, "Unauthorized", {}, None
         )
@@ -333,7 +333,7 @@ def test_probe_mcp_unauthorised(monkeypatch):
 def test_probe_mcp_unreachable(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         raise frihet.urllib.error.URLError("DNS failure")
 
     result = frihet.probe_mcp(opener=opener)
@@ -344,14 +344,14 @@ def test_probe_mcp_unreachable(monkeypatch):
 def test_probe_mcp_malformed_response(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
     response = FakeResponse(b"<html>not json</html>", status=200)
-    result = frihet.probe_mcp(opener=lambda req, t: response)
+    result = frihet.probe_mcp(opener=lambda req, t=None, **kw: response)
     assert result["success"] is False
     assert result["error"] == "malformed_response"
 
 
 def test_probe_mcp_rejects_malformed_url(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_test_12345678")
-    result = frihet.probe_mcp(url="not-a-url", opener=lambda req, t: FakeResponse())
+    result = frihet.probe_mcp(url="not-a-url", opener=lambda req, t=None, **kw: FakeResponse())
     assert result["success"] is False
     assert result["error"] == "malformed_url"
 
@@ -371,7 +371,7 @@ def test_doctor_without_api_key_still_runs_probe(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
     response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t: response)
+    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     # The four states are exposed explicitly.
     assert "states" in result
     assert result["states"]["endpoint_reachable"] is True
@@ -410,7 +410,7 @@ def test_doctor_with_hermes_config_but_no_api_key_marks_authenticated_false(
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
 
     response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t: response)
+    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     assert result["states"]["mcp_configured_in_hermes"] == "configured"
     # Without an Authorization header, the probe got 200 (demo / OAuth
     # discovery). ``authenticated`` reflects what the server told us about
@@ -434,7 +434,7 @@ def test_doctor_with_api_key_marks_authenticated(monkeypatch, tmp_path):
     response = FakeResponse(_ok_response(), status=200)
     captured = {}
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         captured["authorization"] = request.headers.get("Authorization", "")
         return response
 
@@ -459,7 +459,7 @@ def test_doctor_distinguishes_reachable_from_authenticated(monkeypatch, tmp_path
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
     response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t: response)
+    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     assert result["states"]["endpoint_reachable"] is True
     assert result["states"]["mcp_configured_in_hermes"] == "configured"
     # Server returned 200 but we sent no credential → not authenticated.
@@ -480,7 +480,7 @@ def test_doctor_reports_unauthorized_state(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
             request.full_url, 401, "Unauthorized", {}, None
         )
@@ -503,7 +503,7 @@ def test_doctor_ok_false_when_state_is_unknown(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("FRIHET_API_KEY", "fri_anything_12345678")
     response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t: response)
+    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     assert result["states"]["mcp_configured_in_hermes"] == "unknown"
     assert result["states"]["authenticated"] is True
     assert result["ok"] is False, "unknown state must keep umbrella false"
@@ -536,7 +536,7 @@ def test_doctor_oauth_flow_with_token_storage_present(monkeypatch, tmp_path):
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
 
     response = FakeResponse(_ok_response(), status=200)
-    result = frihet.doctor(opener=lambda req, t: response)
+    result = frihet.doctor(opener=lambda req, t=None, **kw: response)
     assert result["states"]["mcp_configured_in_hermes"] == "configured"
     # Anonymous probe, even when server replies 200: we did not present
     # any credential. ``authenticated`` stays False.
@@ -595,7 +595,7 @@ def test_status_reports_no_secrets():
 def test_setup_restores_previous_env(monkeypatch):
     monkeypatch.delenv("FRIHET_API_KEY", raising=False)
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         # The candidate key was used in the request, and it should NOT leak
         # into the persisted env after setup() returns.
         assert "Bearer fri_candidate_12345678" in request.headers.get("Authorization", "")
@@ -610,14 +610,14 @@ def test_setup_restores_previous_env(monkeypatch):
 def test_setup_with_no_key_validates_current(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_existing_12345678")
     response = FakeResponse(_ok_response(), status=200)
-    report = frihet.setup(opener=lambda req, t: response)
+    report = frihet.setup(opener=lambda req, t=None, **kw: response)
     assert report["success"] is True
 
 
 def test_setup_reports_failure_on_unauthorised(monkeypatch):
     monkeypatch.setenv("FRIHET_API_KEY", "fri_existing_12345678")
 
-    def opener(request, timeout):
+    def opener(request, timeout=None):
         raise frihet.urllib.error.HTTPError(  # type: ignore[attr-defined]
             request.full_url, 401, "Unauthorized", {}, None
         )

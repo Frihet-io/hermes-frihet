@@ -197,7 +197,12 @@ IRREVERSIBLE_PATTERNS: tuple[str, ...] = (
     "send",
     "markPaid",
     "mark_paid",
+    "markInvoicePaid",  # used by the ``mark_invoice_paid`` tool family
+    "mark_invoice_paid",
+    "markInvoice",
+    "mark_invoice",
     "finalize",
+    "finalise",
     "issue",
     "delete",
     "destroy",
@@ -210,6 +215,8 @@ IRREVERSIBLE_PATTERNS: tuple[str, ...] = (
     "create_payment",
     "applyCreditNote",
     "apply_credit_note",
+    "applyLateFee",
+    "apply_late_fee",
 )
 
 # Operations that should always produce a draft (never a finalised document).
@@ -427,7 +434,11 @@ def probe_mcp(
     started = time.monotonic()
     presented_credential = bool(api_key())
     try:
-        with open_fn(request, seconds) as response:  # type: ignore[arg-type]
+        # ``urlopen(request, timeout=...)`` — never pass timeout as the
+        # second positional argument; that slot is ``data`` (the request
+        # body) and a float there raises TypeError before the request
+        # goes out.
+        with open_fn(request, timeout=seconds) as response:  # type: ignore[arg-type]
             raw = response.read().decode("utf-8", errors="replace")
             status = getattr(response, "status", 200)
     except urllib.error.HTTPError as exc:
