@@ -46,6 +46,72 @@ CLIENT_VERSION = "0.1.0"
 # ─── Public env contract ────────────────────────────────────────────────────
 
 
+DEFAULT_HERMES_HOME = os.path.expanduser("~/.hermes")
+CONFIG_FILENAME = "config.yaml"
+
+
+def hermes_home() -> str:
+    """Return the path Hermes considers its home directory.
+
+    Honours ``HERMES_HOME`` (the documented env var) and falls back to
+    ``~/.hermes``. This is a public contract — ``HERMES_HOME`` is how
+    every Hermes script finds its config — so we are not reaching into
+    Hermes internals; we are reading a documented user-visible path.
+    """
+    raw = os.getenv("HERMES_HOME", "").strip()
+    return raw or DEFAULT_HERMES_HOME
+
+
+def mcp_server_block_present(name: str = "frihet") -> str | None:
+    """Return ``"configured"``, ``"missing"``, or ``"unknown"`` for the
+    ``mcp_servers.<name>`` block in Hermes's config.
+
+    We deliberately DO NOT use ``hermes_cli.mcp_config`` to answer this:
+    its ``mcp_servers`` introspection helpers are not part of the public
+    Hermes API surface, and a plugin that reaches into them would be
+    breaking on every Hermes release.
+
+    Instead we read ``$HERMES_HOME/config.yaml`` directly. That file is
+    the contract the user sees — it is the same file they edit when
+    adding an MCP server. We use a tolerant YAML parse so a hand-written
+    config with comments or extra keys still works.
+
+    Tri-state:
+
+    - ``"configured"`` — the block exists and references this plugin's
+      URL (or any URL, when ``strict`` is False).
+    - ``"missing"`` — the block is absent (we can prove this by parsing
+      the file ourselves).
+    - ``"unknown"`` — the file could not be read or parsed, so we cannot
+      make a reliable claim. Reporting "configured" here would be a lie;
+      reporting "missing" would surprise users whose config has unusual
+      YAML we cannot parse.
+    """
+    home = hermes_home()
+    cfg_path = os.path.join(home, CONFIG_FILENAME)
+    if not os.path.isfile(cfg_path):
+        return "unknown"
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        with open(cfg_path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        # Bad YAML, permission error, exotic encoding — we don't know.
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return "missing"
+    block = servers.get(name)
+    if block is None:
+        return "missing"
+    # Block exists. We trust the user's config: if they put anything under
+    # ``mcp_servers.frihet`` they intend Frihet to be configured.
+    return "configured"
+
+
 def api_key() -> str:
     """Return the configured Frihet API key, or ``''`` if not set.
 
@@ -353,11 +419,13 @@ def probe_mcp(
             "success": False,
             "error": "malformed_url",
             "url": redact(target),
+            "presented_credential": bool(api_key()),
             "hint": "FRIHET_MCP_URL must be a full https:// URL.",
         }
     request = _build_initialize_request(target)
     open_fn = opener or urllib.request.urlopen
     started = time.monotonic()
+    presented_credential = bool(api_key())
     try:
         with open_fn(request, seconds) as response:  # type: ignore[arg-type]
             raw = response.read().decode("utf-8", errors="replace")
@@ -371,6 +439,7 @@ def probe_mcp(
                 "url": redact(target),
                 "status": exc.code,
                 "elapsed_ms": elapsed,
+                "presented_credential": presented_credential,
                 "hint": (
                     "FRIHET_API_KEY is missing or rejected. Generate one at "
                     "https://app.frihet.io/settings/api and store it in "
@@ -383,6 +452,7 @@ def probe_mcp(
             "url": redact(target),
             "status": exc.code,
             "elapsed_ms": elapsed,
+            "presented_credential": presented_credential,
         }
     except urllib.error.URLError as exc:
         elapsed = round((time.monotonic() - started) * 1000)
@@ -392,6 +462,7 @@ def probe_mcp(
             "error": "mcp_unreachable",
             "url": redact(target),
             "elapsed_ms": elapsed,
+            "presented_credential": presented_credential,
             "reason": redact(str(reason)),
             "hint": (
                 "Cannot reach the Frihet MCP endpoint. Check your network "
@@ -405,6 +476,7 @@ def probe_mcp(
             "error": "mcp_timeout",
             "url": redact(target),
             "timeout_s": seconds,
+            "presented_credential": presented_credential,
             "hint": (
                 "The MCP probe exceeded the configured timeout. Increase "
                 "FRIHET_MCP_TIMEOUT_SECONDS or check your network latency."
@@ -419,6 +491,7 @@ def probe_mcp(
             "error": "malformed_response",
             "url": redact(target),
             "elapsed_ms": elapsed,
+            "presented_credential": presented_credential,
             "preview": redact(raw[:200]),
         }
     server_info = (parsed_body.get("result") or {}).get("serverInfo") or {}
@@ -428,6 +501,7 @@ def probe_mcp(
         "url": redact(target),
         "elapsed_ms": elapsed,
         "status": status,
+        "presented_credential": presented_credential,
         "server": {
             "name": str(server_info.get("name") or ""),
             "version": str(server_info.get("version") or ""),
@@ -453,10 +527,16 @@ def status() -> dict[str, Any]:
             "scheme": parsed.scheme,
             "host": parsed.hostname,
             "timeout_seconds": timeout_seconds(),
+            "server_block_in_config": mcp_server_block_present("frihet"),
         },
         "auth": {
             "api_key_configured": key_present,
             "api_key_source": "env" if key_present else "missing",
+            "note": (
+                "api_key_configured is NOT a synonym for mcp_configured_in_hermes: "
+                "OAuth flows have no env var and are configured via "
+                "mcp_servers.frihet in Hermes's config.yaml."
+            ),
         },
         "safety": {
             "irreversible_patterns": list(IRREVERSIBLE_PATTERNS),
@@ -473,55 +553,74 @@ def doctor(
 ) -> dict[str, Any]:
     """Run the liveness probe and return a structured report.
 
-    The doctor answers FOUR distinct questions, because ``reachable``,
-    ``authenticated`` and ``mcp_ready`` are NOT the same thing:
+    Epistemological contract: every state is ``true``, ``false`` or
+    ``"unknown"``. We do NOT collapse into a single ``ok`` boolean
+    because the four states are NOT the same thing and conflating them
+    is what made the previous version look "smart" while lying to the
+    user (it set ``mcp_configured_in_hermes = true`` whenever an API
+    key was set, even though OAuth-only flows have no API key at all).
 
-      1. ``endpoint_reachable`` — did the network handshake land on a server?
-         (HTTP 2xx/4xx/5xx all count as reachable.)
-      2. ``mcp_configured_in_hermes`` — is the ``mcp_servers.frihet`` block
-         wired into the host's config? (Today this plugin reports ``True``
-         only when ``FRIHET_API_KEY`` is set or OAuth was completed
-         through ``mcp_oauth_manager``; a future version will introspect
-         ``~/.hermes/config.yaml``.)
-      3. ``authentication_required`` / ``authenticated`` — does the server
-         demand auth, and does our credential pass? An anonymous 200 is
-         *reachable* but NOT *authenticated*.
-      4. ``tools_available`` — does the server's ``initialize`` response
-         parse as a recognisable MCP shape, with serverInfo populated?
+    States returned:
 
-    We DO NOT collapse these into a single ``ok`` boolean: a "connected"
-    flag that flips true on HTTP 200 would lie. The summary line at
-    the end prints the four states side by side so the operator sees the
-    difference at a glance.
+      * ``endpoint_reachable`` (bool) — did the MCP handshake land on a
+        server? HTTP 2xx/4xx/5xx all count.
+      * ``mcp_configured_in_hermes`` (tri-state) — did ``$HERMES_HOME/
+        config.yaml`` carry an ``mcp_servers.frihet`` block? We parse
+        that file directly (it is the user-visible contract) rather than
+        reaching into ``hermes_cli.mcp_config`` internals. ``unknown``
+        means we could not read the file — we refuse to lie.
+      * ``authenticated`` (tri-state) — did the MCP handshake succeed
+        with our credential? ``true``/``false`` are observable facts;
+        ``"unknown"`` only happens when the probe was not run (we still
+        run it even without a key, so this is rarely unknown).
+      * ``tools_available`` (tri-state) — did the server's ``initialize``
+        response carry a populated ``serverInfo`` and parse as MCP?
+        Same tri-state contract.
+
+    The umbrella ``ok`` is ``True`` only when all four states are
+    ``True``. Reachability alone is not enough.
 
     The probe is ALWAYS run. When ``FRIHET_API_KEY`` is unset we send
-    the handshake without an ``Authorization`` header — the canonical
-    Frihet MCP may answer (demo mode, OAuth discovery probe) or reject
-    with 401, and either outcome is information the user needs.
+    the handshake without an Authorization header — the canonical Frihet
+    MCP may answer (demo / OAuth discovery) or reject with 401, and
+    either outcome is information the user needs.
     """
     snapshot = status()
     probe = probe_mcp(url=url, timeout=timeout, opener=opener)
 
     reachable = bool(probe.get("status"))
     mcp_shape = bool(probe.get("server", {}).get("name"))
-    key_present = bool(api_key())
     unauth = probe.get("error") == "mcp_unauthorized"
+    server_block = mcp_server_block_present("frihet")
+    presented_credential = bool(probe.get("presented_credential"))
 
-    states = {
+    # Tri-state logic: ``authenticated`` is True ONLY when we presented a
+    # credential AND the server accepted it. We do NOT report ``True``
+    # for an anonymous 200 — that is reachable but not authenticated.
+    probe_succeeded = probe.get("success") is True and not unauth
+    states: dict[str, Any] = {
         "endpoint_reachable": reachable,
-        "mcp_configured_in_hermes": key_present,  # best signal we have today
-        "authenticated": (probe.get("success") is True)
-        and (not unauth)
-        and key_present,
-        "tools_available": mcp_shape and probe.get("success") is True,
+        "mcp_configured_in_hermes": server_block,  # tri-state string
+        "authenticated": (
+            "unknown"
+            if probe.get("error") == "probe_skipped"
+            else (probe_succeeded and presented_credential)
+        ),
+        "tools_available": (
+            "unknown"
+            if probe.get("error") == "probe_skipped"
+            else (mcp_shape and probe_succeeded)
+        ),
     }
 
     snapshot["probe"] = probe
     snapshot["states"] = states
-    # Legacy single-ok flag kept for callers that already use it. It is
-    # ``True`` only when ALL four states are true. Reachability alone is
-    # not enough to flip this flag.
-    snapshot["ok"] = all(states.values())
+    # Umbrella ``ok`` only when every state is the literal ``True`` bool
+    # OR the positive tri-state ``"configured"``. Anything else (False or
+    # ``"unknown"``) keeps the umbrella at False.
+    def _is_good(value: Any) -> bool:
+        return value is True or value == "configured"
+    snapshot["ok"] = all(_is_good(v) for v in states.values())
     return snapshot
 
 
