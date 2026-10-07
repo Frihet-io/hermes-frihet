@@ -93,18 +93,21 @@ In any Hermes chat session:
 /frihet doctor    # live MCP handshake — reports four explicit states
 ```
 
-`/frihet doctor` reports four booleans side by side rather than a single
+`/frihet doctor` reports four states side by side rather than a single
 `connected` flag, because those four states are NOT the same thing:
 
-| State | Means |
-|-------|-------|
-| `endpoint_reachable` | The network handshake landed on a server (HTTP 2xx/4xx/5xx). |
-| `mcp_configured_in_hermes` | A credential is wired into `mcp_servers.frihet` (Bearer key or completed OAuth). |
-| `authenticated` | The server returned 200 + valid MCP handshake with our credential. |
-| `tools_available` | The `initialize` response carries a populated `serverInfo` and parses as MCP. |
+| State | Type | Means |
+|-------|------|-------|
+| `endpoint_reachable` | bool | The network handshake landed on a server (HTTP 2xx/4xx/5xx). |
+| `mcp_configured_in_hermes` | tri-state | A `mcp_servers.frihet` block exists in `$HERMES_HOME/config.yaml`. `"configured"` / `"missing"` / `"unknown"` (the last when the file is unreadable). |
+| `authenticated` | tri-state | The server accepted the credential we presented. `True`/`False`/`"unknown"`. Anonymous 200 is reachable but NOT authenticated. |
+| `tools_available` | tri-state | The `initialize` response carries a populated `serverInfo` and parses as MCP. |
 
 An anonymous HTTP 200 is reachable but NOT authenticated. The umbrella
-`ok` only flips true when all four states are true.
+`ok` flips True only when every state is `True` or `"configured"`. We
+deliberately do NOT use `api_key_present` as a synonym for
+`mcp_configured_in_hermes`: an OAuth-first flow has no env var at all,
+so conflating the two would be a known false negative.
 
 Then ask Hermes:
 

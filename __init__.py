@@ -81,8 +81,8 @@ def _command(raw_args: str) -> str:
                 "doctor": (
                     "Live MCP probe — reports endpoint_reachable, "
                     "mcp_configured_in_hermes, authenticated, and "
-                    "tools_available as separate booleans (NOT a single "
-                    "connected flag)."
+                    "tools_available as tri-state (true / false / "
+                    "unknown). Never a single 'connected' flag."
                 ),
             },
         }
