@@ -48,6 +48,7 @@ CLIENT_VERSION = "0.1.0"
 
 DEFAULT_HERMES_HOME = os.path.expanduser("~/.hermes")
 CONFIG_FILENAME = "config.yaml"
+MCP_TOKEN_FILENAME = "mcp-tokens"  # dir containing <name>.json per MCP server
 
 
 def hermes_home() -> str:
@@ -60,6 +61,45 @@ def hermes_home() -> str:
     """
     raw = os.getenv("HERMES_HOME", "").strip()
     return raw or DEFAULT_HERMES_HOME
+
+
+def cached_oauth_token(name: str = "frihet") -> str | None:
+    """Read the OAuth access token that the Hermes native MCP client
+    cached for the named server, if present.
+
+    Hermes writes tokens under ``$HERMES_HOME/mcp-tokens/<name>.json``
+    after a successful ``hermes mcp login`` or the Desktop's OAuth
+    flow. The schema is what ``HermesTokenStorage`` writes (an
+    ``access_token`` field among others). Reading this file is the
+    documented user-visible contract — the same file the user can
+    inspect themselves — not an internal API.
+
+    We only read the token. We never write to this directory. We
+    NEVER log it. ``redact()`` handles any accidental echo.
+
+    Returns ``None`` if the file is missing, malformed, the token is
+    expired, or there is no ``access_token`` field. The caller treats
+    this exactly like ``api_key()`` returning ``""``.
+    """
+    home = hermes_home()
+    token_path = os.path.join(home, MCP_TOKEN_FILENAME, f"{name}.json")
+    if not os.path.isfile(token_path):
+        return None
+    try:
+        with open(token_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    access = data.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    # Respect expiry when the cache file does.
+    exp = data.get("expires_at")
+    if isinstance(exp, (int, float)) and exp > 0 and exp < time.time():
+        return None
+    return access.strip()
 
 
 def mcp_server_block_present(name: str = "frihet") -> str | None:
@@ -363,6 +403,7 @@ def _build_initialize_request(url: str) -> urllib.request.Request:
         },
     }
     key = api_key()
+    oauth = cached_oauth_token()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -370,6 +411,11 @@ def _build_initialize_request(url: str) -> urllib.request.Request:
     }
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    elif oauth:
+        # OAuth flow has cached a token. Prefer it over no credential.
+        # Never log the token; the redact() function masks it on any
+        # accidental echo.
+        headers["Authorization"] = f"Bearer {oauth}"
     return urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -432,7 +478,12 @@ def probe_mcp(
     request = _build_initialize_request(target)
     open_fn = opener or urllib.request.urlopen
     started = time.monotonic()
-    presented_credential = bool(api_key())
+    # ``presented_credential`` is true when we actually sent an
+    # Authorization header — either via FRIHET_API_KEY or via the cached
+    # OAuth token. It must reflect what we SENT, not what the server
+    # said, so doctor() can reason honestly about anonymous probes.
+    auth_header = request.headers.get("Authorization", "").strip()
+    presented_credential = bool(auth_header)
     try:
         # ``urlopen(request, timeout=...)`` — never pass timeout as the
         # second positional argument; that slot is ``data`` (the request

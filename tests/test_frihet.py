@@ -812,3 +812,101 @@ def test_mcp_config_dict_auth_shape_is_silent_misconfiguration(
     # But it should log a warning so an attentive one sees it.
     # (We accept either: the warning was emitted, or it was not. The important
     # contract is that the plugin doesn't LIE by reporting "missing" here.)
+
+
+# ─── OAuth token cache (Hermes writes to ~/.hermes/mcp-tokens/<name>.json) ──
+# The doctor should be able to verify an MCP server even when the only
+# credential is the OAuth token Hermes itself cached — not just when
+# FRIHET_API_KEY is set. This lets ``authenticated`` flip True in an
+# OAuth-first install where no env var exists at all.
+
+
+def test_cached_oauth_token_returns_none_when_missing(monkeypatch, tmp_path):
+    """No ``$HERMES_HOME/mcp-tokens/<name>.json`` -> ``None`` (treat like
+    no credential). The doctor must not invent auth."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty"))
+    assert frihet.cached_oauth_token("frihet") is None
+
+
+def test_cached_oauth_token_returns_access_token(monkeypatch, tmp_path):
+    home = tmp_path / "hermes-oauth-cache"
+    home.mkdir(parents=True)
+    tokens = home / "mcp-tokens"
+    tokens.mkdir()
+    # Match the live Hermes cache schema (``expires_at`` is a Unix
+    # timestamp; we set it far in the future so it stays valid).
+    import time as _t
+    tokens.joinpath("frihet.json").write_text(
+        '{"access_token": "fri_oauth_demo_abc123def456ghi789",'
+        ' "token_type": "Bearer",'
+        ' "expires_at": %d,'
+        ' "scope": "read write"}' % int(_t.time() + 3600),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert frihet.cached_oauth_token("frihet") == "fri_oauth_demo_abc123def456ghi789"
+
+
+def test_cached_oauth_token_returns_none_for_expired(monkeypatch, tmp_path):
+    """Expired token is treated as no token — doctor must not flip True
+    on a stale credential."""
+    home = tmp_path / "hermes-stale"
+    home.mkdir(parents=True)
+    tokens = home / "mcp-tokens"
+    tokens.mkdir()
+    tokens.joinpath("frihet.json").write_text(
+        '{"access_token": "fri_old", "expires_at": 1}',  # epoch 1 = expired
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert frihet.cached_oauth_token("frihet") is None
+
+
+def test_cached_oauth_token_returns_none_for_malformed(monkeypatch, tmp_path):
+    home = tmp_path / "hermes-junk"
+    home.mkdir(parents=True)
+    tokens = home / "mcp-tokens"
+    tokens.mkdir()
+    tokens.joinpath("frihet.json").write_text("{ this is not valid json", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert frihet.cached_oauth_token("frihet") is None
+
+
+def test_probe_uses_oauth_token_when_no_api_key(monkeypatch, tmp_path):
+    """With OAuth cache present and no API key, ``probe_mcp`` sends
+    Authorization: Bearer <oauth>. We verify the header was set and that
+    the probe returns ``presented_credential=True``."""
+    import time as _t
+    home = tmp_path / "hermes-oauth-real"
+    home.mkdir(parents=True)
+    (home / "mcp-tokens").mkdir()
+    (home / "mcp-tokens" / "frihet.json").write_text(
+        '{"access_token": "fri_oauth_test_xyz12345",'
+        ' "expires_at": %d}' % int(_t.time() + 3600),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("FRIHET_API_KEY", raising=False)
+
+    captured = {}
+    def opener(request, timeout=None, **kw):
+        captured["authorization"] = request.headers.get("Authorization", "")
+        captured["user_agent"] = request.headers.get("User-Agent", "")
+        # Return a valid MCP initialize response
+        body = (
+            b'data: {"jsonrpc":"2.0","id":1,"result":{'
+            b'"protocolVersion":"2025-06-18",'
+            b'"serverInfo":{"name":"frihet-mcp","version":"1.16.6"}}}\n\n'
+        )
+        return type('FakeResp', (), {
+            'read': lambda self: body,
+            'status': 200,
+            '__enter__': lambda self: self,
+            '__exit__': lambda self, *a: None,
+        })()
+
+    result = frihet.probe_mcp(opener=opener)
+    assert captured["authorization"] == "Bearer fri_oauth_test_xyz12345"
+    assert result["presented_credential"] is True
+    assert result["success"] is True
+    assert result["server"]["name"] == "frihet-mcp"
