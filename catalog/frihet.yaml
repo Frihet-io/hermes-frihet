@@ -13,10 +13,24 @@
 #   ship a meaningful change (rule 4 of the catalog admission policy).
 name: frihet
 repo: https://github.com/Frihet-io/hermes-frihet
-# Pinned SHA — Frihet-io/hermes-frihet @ v0.1.0 (feat(doctor): honour
-# the Hermes OAuth token cache when no API key is set). 75 tests green,
-# hermes plugins validate --install-deps 15/15, security scan safe.
-sha: f3312087a8acda01ee3a5b089017f2a2657d2d5c
+# Pinned SHA — Frihet-io/hermes-frihet @ v0.1.0
+# (fix(plugin): stop reading ~/.hermes/mcp-tokens; auth via ctx.call_mcp).
+#
+# This SHA supersedes ``f331208`` (the older doctor that read the OAuth
+# token cache). It pins:
+#   * Hook dispatcher that passes the FULL tool name to the gate (no
+#     more silent bypass of the approval gate).
+#   * Doctor that derives auth evidence from ``ctx.call_mcp`` — the
+#     plugin never reads ~/.hermes/mcp-tokens.
+#   * Doctor that drops the list_invoices envelope from its output
+#     (no invoice/customer data leaks through /frihet doctor).
+#   * Setup that does NOT accept credentials as slash-command
+#     arguments (no transcript leak).
+#   * Hermetic ``/frihet doctor`` tri-state semantics.
+#
+# Tests: 71 pass + 3 pre-existing skips. hermes plugins validate
+# --install-deps 15/15 with security scan "safe".
+sha: 24a9612c1396164f496e963c33a046994fb4b089
 description: "Official Hermes Agent integration for Frihet — discoverability, setup, diagnostics, and operating guidance for the Frihet MCP. Zero duplicated tools; the canonical 158-operation Frihet surface stays in @frihet/mcp-server and the remote endpoint https://mcp.frihet.io/mcp."
 maintainer: Frihet-io
 tier: community

@@ -27,7 +27,9 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pytest-mock
+          # pyyaml is required by the manifest-validation steps below
+          # (the plugin itself is stdlib-only — these deps are CI-only).
+          python -m pip install pytest pytest-mock pyyaml
 
       - name: Byte-compile sources (catches syntax errors fast)
         run: |
@@ -127,7 +129,7 @@ jobs:
       - name: Install pytest
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pytest-mock
+          python -m pip install pytest pytest-mock pyyaml
       - name: Run unit tests
         env:
           FRIHET_API_KEY: ""
@@ -135,18 +137,96 @@ jobs:
         run: python -m pytest tests/test_frihet.py -q
 
   hermes-validate:
-    name: Hermes plugin validate (opt-in)
+    name: Hermes plugin manifest validate (CI gate)
     runs-on: ubuntu-latest
-    # Only run on tagged commits / main branch PRs to keep PR-runs fast.
+    # Load-bearing CI gate: runs on every push and every PR. Mirrors what
+    # ``hermes plugins validate`` does without requiring Hermes itself
+    # installed on the runner — the catalog maintainer runs the
+    # full admission test on a Hermes-enabled runner for the upstream PR.
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
-      - name: Run hermes plugins validate
-        env:
-          FRIHET_API_KEY: ""
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
         run: |
-          # The Hermes runner is opt-in. If the maintainer wants strict
-          # catalog admission CI, they replace the conditional below with
-          # ``hermes plugins validate --install-deps .``. The unit + lint
-          # job above is the load-bearing CI gate today.
-          echo "hermes plugins validate is opt-in — see README for instructions."
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml
+
+      - name: Validate plugin.yaml (schema + field types + env keys)
+        run: |
+          python - <<'PY'
+          """Mirrors ``hermes plugins validate`` for the parts that do not
+          require a live Hermes runtime: schema, field types, requires_env
+          shape, version semantics, and irreversible-pattern declarations.
+          The actual Hermes admission runs on a Nous-hosted runner.
+          """
+          import re, sys, yaml, pathlib
+
+          fail = []
+          manifest = yaml.safe_load(pathlib.Path("plugin.yaml").read_text())
+
+          # Required fields.
+          for k in ("name", "version", "description", "author", "kind"):
+              if not manifest.get(k):
+                  fail.append(f"missing required field: {k}")
+
+          # List-typed fields.
+          for fld in ("provides_tools", "provides_hooks", "provides_middleware", "requires_env"):
+              v = manifest.get(fld)
+              if v is not None and not isinstance(v, list):
+                  fail.append(f"{fld} must be a list, got {type(v).__name__}")
+
+          # requires_hermes version spec.
+          spec = str(manifest.get("requires_hermes") or "").strip()
+          if spec and not re.match(r"^>=\d+\.\d+", spec):
+              fail.append(f"requires_hermes spec {spec!r} must start with '>='")
+
+          # requires_env entries UPPER_SNAKE_CASE.
+          for entry in manifest.get("requires_env") or []:
+              if not re.match(r"^[A-Z][A-Z0-9_]*$", entry):
+                  fail.append(f"requires_env entry {entry!r} is not UPPER_SNAKE_CASE")
+
+          # Capability declaration cross-check (load plugin module).
+          sys.path.insert(0, ".")
+          import importlib.util
+          spec_mod = importlib.util.spec_from_file_location("frihet_mod", "__init__.py")
+          mod = importlib.util.module_from_spec(spec_mod)
+          spec_mod.loader.exec_module(mod)
+          # We can probe the dispatcher surface without invoking it: it
+          # must expose ``_pre_tool_call`` and a register() that registers
+          # one pre_tool_call hook.
+          if not callable(getattr(mod, "_pre_tool_call", None)):
+              fail.append("__init__.py must expose _pre_tool_call callable")
+
+          # Frihet safety table must list createPayment as irreversible.
+          spec_frihet = importlib.util.spec_from_file_location("frihet_pkg", "frihet.py")
+          frihet = importlib.util.module_from_spec(spec_frihet)
+          spec_frihet.loader.exec_module(frihet)
+          if "createPayment" not in frihet.IRREVERSIBLE_PATTERNS:
+              fail.append("createPayment must be in IRREVERSIBLE_PATTERNS")
+
+          # Catalogue-upstream manifest cross-check.
+          up_data = yaml.safe_load(
+              pathlib.Path("upstream/frihet-mcp-manifest.yaml").read_text()
+          )
+          for k in ("manifest_version", "name", "transport", "auth"):
+              if k not in up_data:
+                  fail.append(f"upstream manifest missing {k}")
+          if up_data.get("transport", {}).get("type") != "http":
+              fail.append("upstream transport must be http")
+          if up_data.get("auth", {}).get("type") not in ("oauth", "oauth_pkce"):
+              fail.append("upstream auth must be oauth/oauth_pkce")
+
+          if fail:
+              for line in fail:
+                  print(f"FAIL: {line}", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: hermes-validate passed (name={manifest['name']}, version={manifest['version']})")
+          PY
