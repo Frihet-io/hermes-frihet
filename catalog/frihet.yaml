@@ -14,10 +14,10 @@
 name: frihet
 repo: https://github.com/Frihet-io/hermes-frihet
 # Pinned SHA — Frihet-io/hermes-frihet @ v0.1.0
-# (fix(plugin): stop reading ~/.hermes/mcp-tokens; auth via ctx.call_mcp).
+# (ci: rename hermes-validate to manifest-validate; add live-hermes-validate).
 #
 # This SHA supersedes ``f331208`` (the older doctor that read the OAuth
-# token cache). It pins:
+# token cache) AND ``24a9612`` (the first privacy-only fix). It pins:
 #   * Hook dispatcher that passes the FULL tool name to the gate (no
 #     more silent bypass of the approval gate).
 #   * Doctor that derives auth evidence from ``ctx.call_mcp`` — the
@@ -26,11 +26,20 @@ repo: https://github.com/Frihet-io/hermes-frihet
 #     (no invoice/customer data leaks through /frihet doctor).
 #   * Setup that does NOT accept credentials as slash-command
 #     arguments (no transcript leak).
-#   * Hermetic ``/frihet doctor`` tri-state semantics.
+#   * Slash-command rejection of unknown subcommands and unexpected
+#     positional arguments — neither branch echoes user input back.
+#   * redact() per-line masking: every Authorization: line is masked
+#     independently, including mislabelled secrets (token=, secret:,
+#     api_key:, password=).
+#   * Connector manifest tools.default_enabled with 50 read+create-draft
+#     operations, no pre-checked mutating ops. Users opt in to
+#     write tools via 'hermes mcp configure frihet'.
+#   * CI renamed to manifest-validate (schema-only) plus a manual
+#     live-hermes-validate (workflow_dispatch) for maintainers.
 #
-# Tests: 71 pass + 3 pre-existing skips. hermes plugins validate
+# Tests: 79 pass + 3 pre-existing skips. hermes plugins validate
 # --install-deps 15/15 with security scan "safe".
-sha: 24a9612c1396164f496e963c33a046994fb4b089
+sha: b9a806710511f6193f7eefa1819a2beb3d295387
 description: "Official Hermes Agent integration for Frihet — discoverability, setup, diagnostics, and operating guidance for the Frihet MCP. Zero duplicated tools; the canonical 158-operation Frihet surface stays in @frihet/mcp-server and the remote endpoint https://mcp.frihet.io/mcp."
 maintainer: Frihet-io
 tier: community
