@@ -318,9 +318,53 @@ def test_classify_read_tools():
 
 
 def test_classify_draft_first_writes():
-    for name in ["createInvoice", "create_quote", "create_credit_note"]:
+    """Operations that are *local* drafts in the Frihet contract and
+    NOT in the canonical ``externalSideEffects`` table. The Frihet MCP
+    ``createReservation``, ``create_recurring_invoice``,
+    ``create_deposit``, ``create_vendor`` fall into this bucket —
+    they create a record without triggering a third-party effect.
+    Other ``create_*`` (e.g. ``createInvoice``, ``create_quote``) are
+    now correctly classified as ``irreversible-write`` because the
+    canonical Frihet contract lists them in ``externalSideEffects``.
+    """
+    for name in [
+        "createReservation", "create_recurring_invoice",
+        "create_deposit", "create_vendor",
+    ]:
         result = frihet.classify_tool_call(name)
         assert result["kind"] == "draft-write", f"expected draft-write for {name}"
+
+
+def test_canonical_external_side_effects_classify_as_irreversible():
+    """The canonical Frihet contract lists these tools under
+    ``externalSideEffects``. The classifier MUST treat them as
+    ``irreversible-write`` regardless of whether their verb looks
+    draft-friendly (``create_*``).
+    """
+    expected = [
+        "create_client",        # webhook_delivery_or_configuration
+        "create_quote",         # webhook_delivery_or_configuration
+        "create_invoice",       # webhook + fiscal
+        "create_credit_note",   # webhook
+        "create_expense",       # webhook
+        "create_product",       # webhook
+        "create_webhook",       # webhook
+        "send_invoice",         # email + webhook + fiscal
+        "send_quote",           # email + webhook
+        "send_einvoice",        # fiscal
+        "mark_invoice_paid",    # webhook + fiscal
+        "delete_invoice",       # webhook + fiscal
+    ]
+    for name in expected:
+        result = frihet.classify_tool_call(f"mcp__frihet__{name}")
+        assert result["kind"] == "irreversible-write", (
+            f"{name} should escalate (kind={result['kind']}, "
+            f"source={result.get('source')})"
+        )
+        assert result.get("source") == "canonical_external_side_effects", (
+            f"{name} source {result.get('source')!r} — the canonical "
+            f"contract is the source of truth, not the name pattern"
+        )
 
 
 def test_classify_create_payment_is_irreversible():
@@ -361,8 +405,17 @@ def test_pre_tool_call_gate_read_passes_through():
 
 
 def test_pre_tool_call_gate_draft_write_passes_through():
-    """Draft writes return None — the skill handles the human pause."""
-    assert frihet.pre_tool_call_gate(tool_name="mcp__frihet__createInvoice") is None
+    """True draft operations (local-only creates not in
+    ``externalSideEffects``) return None — the skill handles the
+    human pause. ``createInvoice`` is NO LONGER a draft write; it is
+    in the canonical externalSideEffects table and escalates."""
+    assert frihet.pre_tool_call_gate(tool_name="mcp__frihet__createReservation") is None
+    assert frihet.pre_tool_call_gate(tool_name="mcp__frihet__create_recurring_invoice") is None
+    assert frihet.pre_tool_call_gate(tool_name="mcp__frihet__create_deposit") is None
+    # Sanity check that the canonical contract path escalates:
+    payload = frihet.pre_tool_call_gate(tool_name="mcp__frihet__create_invoice")
+    assert payload is not None
+    assert payload["action"] == "approve"
 
 
 def test_pre_tool_call_gate_irreversible_escalates_to_approval():
@@ -511,11 +564,19 @@ REAL_FRIHET_TOOLS = [
     ("list_products", None),
     ("list_quotes", None),
     ("get_invoice_pdf", None),
-    # draft-writes — must NOT escalate (the skill pauses for human)
-    ("create_invoice", None),
-    ("create_credit_note", None),
-    ("create_client", None),
-    ("create_quote", None),
+    # True draft-writes — local-only creates not in the canonical
+    # externalSideEffects table. Must NOT escalate (the skill pauses).
+    ("createReservation", None),
+    ("create_recurring_invoice", None),
+    ("create_deposit", None),
+    ("create_vendor", None),
+    # externalSideEffects creates — the create verb is misleading. The
+    # canonical Frihet contract lists these as webhook- or fiscal-effect
+    # operations. They MUST escalate even though their name says "create".
+    ("create_invoice", "irreversible-write"),
+    ("create_credit_note", "irreversible-write"),
+    ("create_client", "irreversible-write"),
+    ("create_quote", "irreversible-write"),
     # irreversibles — MUST escalate to action=approve
     ("send_invoice", "irreversible-write"),
     ("mark_invoice_paid", "irreversible-write"),

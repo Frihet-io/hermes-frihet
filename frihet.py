@@ -32,6 +32,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -299,25 +300,77 @@ IRREVERSIBLE_PATTERNS: tuple[str, ...] = (
 # recorded on the Frihet side, is irreversible (financial effect). It lives in
 # ``IRREVERSIBLE_PATTERNS`` instead.
 DRAFT_FIRST_OPERATIONS: tuple[str, ...] = (
-    "createInvoice",
-    "create_invoice",
-    "createQuote",
-    "create_quote",
-    "createCreditNote",
-    "create_credit_note",
-    "createClient",
-    "create_client",
-    "createClientContact",
-    "create_client_contact",
-    "createClientNote",
-    "create_client_note",
-    "createProduct",
-    "create_product",
-    "createExpense",
-    "create_expense",
-    "logClientActivity",
-    "log_client_activity",
+    "createReservation",
+    "create_reservation",
+    "createRecurringInvoice",
+    "create_recurring_invoice",
+    "createDeposit",
+    "create_deposit",
+    "createVendor",
+    "create_vendor",
 )
+
+
+# ─── Canonical Frihet safety contract (vendor source of truth) ─────────────
+# The Frihet MCP publishes its own authoritative safety contract at
+# ``docs/agent-onboarding.json``. The plugin vendors a frozen copy of
+# that contract and uses it as the source of truth for
+# ``externalSideEffects`` classification. This is more reliable than
+# guessing from operation names alone: the Frihet server's
+# ``_meta["io.frihet/capability"]`` declares that ``create_client``
+# has a ``webhook_delivery_or_configuration`` effect even though the
+# verb is "create".
+#
+# We load the JSON lazily and tolerate missing/malformed files by
+# falling back to the conservative name-pattern lists above. The
+# plugin NEVER fails because of a missing vendor file — it just
+# becomes a stricter classifier.
+_ONBOARDING_JSON_PATH = (
+    Path(__file__).resolve().parent / "vendor" / "frihet-mcp-onboarding.json"
+)
+
+
+def _load_external_side_effects() -> frozenset[str] | None:
+    """Return the set of Frihet tool names declared as having
+    ``externalSideEffects`` in the canonical onboarding contract, or
+    ``None`` if the vendor file is missing / unreadable. The caller
+    treats ``None`` as 'degrade gracefully to name-pattern rules'.
+    """
+    try:
+        with _ONBOARDING_JSON_PATH.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    humanAuthority = data.get("humanAuthority") or {}
+    entries = humanAuthority.get("externalSideEffects") or []
+    if not isinstance(entries, list):
+        return None
+    out: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("tool"), str):
+            out.add(entry["tool"])
+    if not out:
+        return None
+    return frozenset(out)
+
+
+_EXTERNAL_SIDE_EFFECTS_TOOLS: frozenset[str] | None = _load_external_side_effects()
+
+
+def external_side_effects_tools() -> frozenset[str]:
+    """Public accessor for the canonical ``externalSideEffects`` set.
+
+    The classifier uses this to decide whether a Frihet operation
+    should escalate to approval. Returning ``frozenset()`` (empty)
+    means "vendor file missing — fall back to name patterns only".
+    Returning a populated ``frozenset`` means "these tools have
+    declared external effects, treat them as irreversible".
+
+    Tests can monkeypatch this via ``_EXTERNAL_SIDE_EFFECTS_TOOLS``.
+    """
+    return _EXTERNAL_SIDE_EFFECTS_TOOLS or frozenset()
 
 
 def classify_tool_call(tool_name: str) -> dict[str, Any]:
@@ -325,12 +378,46 @@ def classify_tool_call(tool_name: str) -> dict[str, Any]:
 
     Returns a dict with ``kind`` (``"read"`` | ``"draft-write"`` |
     ``"irreversible-write"`` | ``"unknown"``), and a ``hint`` carrying
-    operating guidance. The plugin uses this in ``pre_tool_call`` and the
-    skill references it for documentation.
+    operating guidance.
+
+    Source-of-truth ordering
+    -----------------------
+
+    The classification uses **two** sources of truth, applied in order:
+
+      1. The canonical Frihet MCP contract
+         (``vendor/frihet-mcp-onboarding.json`` —
+         ``Frihet-io/frihet-mcp/docs/agent-onboarding.json``). If a tool
+         is in ``humanAuthority.externalSideEffects`` it is treated as
+         ``"irreversible-write"`` regardless of the verb in its name.
+         This is the authoritative classifier: the Frihet server itself
+         publishes this metadata, so a plugin reviewer can audit the
+         decision.
+      2. Local pattern lists (``IRREVERSIBLE_PATTERNS`` and
+         ``DRAFT_FIRST_OPERATIONS``). These are belt-and-braces for
+         tools the vendor file does not yet name, and they default to
+         fail-closed when the operation shape is unknown.
     """
     if not tool_name:
         return {"kind": "unknown", "hint": "No tool name provided."}
     normalised = tool_name.lower()
+    # Strip the ``mcp__<server>__`` prefix when present, to compare
+    # against the canonical tool names in the contract.
+    bare = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
+    # 1. Canonical externalSideEffects — source of truth.
+    canonical_external = external_side_effects_tools()
+    if bare in canonical_external or bare.lower() in {n.lower() for n in canonical_external}:
+        return {
+            "kind": "irreversible-write",
+            "hint": (
+                f"Per the canonical Frihet MCP contract, `{bare}` has "
+                f"declared externalSideEffects. Re-read the target, confirm "
+                "human authorisation, honour any Idempotency-Key, and do "
+                "NOT retry blindly."
+            ),
+            "source": "canonical_external_side_effects",
+        }
+    # 2. Local pattern fallback.
     if any(pat.lower() in normalised for pat in IRREVERSIBLE_PATTERNS):
         return {
             "kind": "irreversible-write",
@@ -340,6 +427,7 @@ def classify_tool_call(tool_name: str) -> dict[str, Any]:
                 "target record, confirm the human authorised it, "
                 "honour any Idempotency-Key, and do NOT retry blindly."
             ),
+            "source": "name_pattern",
         }
     if any(pat.lower() in normalised for pat in DRAFT_FIRST_OPERATIONS):
         return {
@@ -348,8 +436,13 @@ def classify_tool_call(tool_name: str) -> dict[str, Any]:
                 "Prefer creating a draft first and presenting the "
                 "totals for human approval before any send/mark-paid."
             ),
+            "source": "name_pattern",
         }
-    if normalised.startswith(("get", "list", "search", "describe", "schema", "fetch")):
+    # Read-shape check uses the bare operation (post-prefix-strip), not
+    # the full ``mcp__server__op`` string, otherwise ``mcp__frihet__
+    # list_invoices`` would fail the startswith check. ``bare`` is
+    # already defined earlier in this function.
+    if bare.lower().startswith(("get", "list", "search", "describe", "schema", "fetch")):
         return {"kind": "read", "hint": "Read-only — safe to call."}
     return {
         "kind": "unknown",

@@ -61,12 +61,23 @@ auth:
 #     drop new mutating tools the Frihet server adds.
 tools:
   default_enabled:
-    # Catalogue of read operations: invoices, clients, expenses, quotes,
-    # products, recurring invoices, properties, reservations, webhooks,
-    # fiscal summaries, and the matching ``get_*`` lookups. All are
-    # read-only on the Frihet side. Names are verified against the
-    # canonical Frihet MCP README catalogue
-    # (https://github.com/Frihet-io/frihet-mcp/blob/main/README.md).
+    # Read-only operations. Every name verified against the canonical
+    # Frihet MCP README catalogue (Frihet-io/frihet-mcp/README.md) AND
+    # against the agent-onboarding contract
+    # (Frihet-io/frihet-mcp/docs/agent-onboarding.json).
+    #
+    # **Why only reads?** The Frihet MCP's own contract declares
+    # ``externalSideEffects`` for many ``create_*`` operations — they
+    # can deliver webhooks or trigger fiscal/e-invoice submissions even
+    # when they create a "draft". The Frihet server's own
+    # `externalSideEffects` table is the source of truth, not the verb
+    # in the operation name. We pre-check only reads here so a user
+    # installing Frihet via the Connectors surface without the
+    # companion plugin has zero mutating ops available by default.
+    # Mutating ops are still reachable — the user opts in via
+    # ``hermes mcp configure frihet`` (case 2 of the install-time
+    # tool selection policy). Their opt-in is recorded in
+    # ``~/.hermes/config.yaml`` and survives reinstalls.
     - list_invoices
     - get_invoice
     - search_invoices
@@ -106,21 +117,6 @@ tools:
     - get_business_context
     - get_monthly_summary
     - anomaly_list
-    # Draft-only writes: these create a draft record the user must
-    # explicitly send/finalize later. Even if the connector is used
-    # without the plugin, the model can build a draft without
-    # immediately mutating state.
-    - create_invoice
-    - create_quote
-    - create_client
-    - create_client_contact
-    - create_client_note
-    - create_product
-    - create_expense
-    - create_recurring_invoice
-    - create_reservation
-    - create_vendor
-    - create_deposit
 
 # Composer-suggestion triggers (desktop brand pills).
 suggest:
