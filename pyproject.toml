@@ -28,7 +28,7 @@ dependencies = [
     # (~150 KB) and is already an implicit dependency of Hermes itself
     # (Hermes reads the same config.yaml), so adding it does not
     # expand the install footprint meaningfully.
-    "PyYAML>=6.0",
+    "PyYAML>=6.0,<7",
 ]
 
 [project.optional-dependencies]
