@@ -18,12 +18,18 @@ classifiers = [
   "Framework :: Hermes Agent",
 ]
 
-# No runtime dependencies on purpose.
-# The plugin only consumes Hermes' public PluginContext API and talks to the
-# canonical Frihet MCP endpoint over HTTPS using urllib (stdlib). Keeping
-# dependencies at zero keeps the catalog-admission floor uncontested and the
-# install footprint minimal.
-dependencies = []
+dependencies = [
+    # PyYAML is required by frihet.mcp_server_block_present() to parse
+    # the user's ``~/.hermes/config.yaml`` and decide whether the
+    # ``mcp_servers.frihet`` block is ``configured``, ``missing`` or
+    # ``unknown``. Without PyYAML the function silently returns
+    # ``unknown`` even when a valid block is present, which causes 5
+    # tests in tests/test_frihet.py to fail. PyYAML is stdlib-sized
+    # (~150 KB) and is already an implicit dependency of Hermes itself
+    # (Hermes reads the same config.yaml), so adding it does not
+    # expand the install footprint meaningfully.
+    "PyYAML>=6.0",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-mock>=3.12"]
