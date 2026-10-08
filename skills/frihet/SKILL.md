@@ -99,12 +99,18 @@ ignore on a fiscal action is the worst possible safety hole.
 ```
 /frihet status   # local snapshot, no network
 /frihet doctor   # live MCP handshake
-/frihet setup    # validate FRIHET_API_KEY (or a candidate you paste once)
+/frihet setup    # prints host-level auth guidance; does NOT accept credentials
 ```
 
-`status` is always safe. `doctor` makes one `initialize` round-trip — it
-is read-only on the Frihet side. `setup` only validates; it never writes
-the key to disk and never echoes the candidate.
+`status` is always safe. `doctor` makes one `initialize` round-trip plus,
+when run with the live `PluginContext`, one read-only `list_invoices`
+call against the native MCP client — the plugin itself never reads
+tokens or business data, and the doctor response is scrubbed before
+return (no invoice IDs, no customer names, no totals). `setup` is a
+guidance surface; it does NOT accept credentials as arguments because
+the slash-command transcript is not a safe channel for secrets. Use
+`hermes mcp login frihet` (OAuth/PKCE) or `hermes auth add frihet`
+(unattended API key) instead.
 
 ## What This Plugin Will Never Do
 

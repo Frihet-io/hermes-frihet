@@ -91,9 +91,13 @@ mcp_servers:
 > end with `hermes config set mcp_servers.frihet.auth oauth` (string),
 > not a sub-dict.
 
-> The plugin itself never stores your API key. Any string matching
-> `fri_<24+ chars>` or `Bearer …` is auto-redacted by the bundled
-> `pre_tool_call` hook.
+> The plugin itself never stores your API key. Strings matching
+> `fri_<24+ chars>`, `Bearer …`, or any `token|secret|api_key|password:
+> <value>` shape are redacted by the `status()`, `setup()`, `doctor()`,
+> and `redact()` helpers before they reach slash-command output. The
+> `pre_tool_call` hook does NOT redact — it only classifies and
+> escalates; the redaction contract lives in the helper functions, not
+> in the hook.
 
 ## Use
 
@@ -101,9 +105,15 @@ In any Hermes chat session:
 
 ```text
 /frihet status    # local snapshot — no network
-/frihet setup     # validate FRIHET_API_KEY (or a candidate you paste once)
+/frihet setup     # prints host-level auth guidance; does NOT accept credentials
 /frihet doctor    # live MCP handshake — reports four explicit states
 ```
+
+`/frihet setup` no longer accepts a candidate API key. Passing one in chat
+would land it in the slash-command transcript. Use `hermes mcp login frihet`
+(OAuth/PKCE) or `hermes auth add frihet` (unattended API key) instead —
+those are the host-level auth surfaces, and they leave no plugin transcript
+behind.
 
 `/frihet doctor` reports four states side by side rather than a single
 `connected` flag, because those four states are NOT the same thing:
@@ -135,8 +145,12 @@ Hermes will:
 3. Render the result.
 
 The bundled skill guides every read/write to honour the Frihet operating
-contract. Irreversible writes surface an advisory the model can act on; the
-plugin never blocks a call.
+contract. Irreversible writes escalate to Hermes's human approval gate
+via the `pre_tool_call` hook (`{"action": "approve", ...}`) — Hermes
+prompts the user before the tool runs. Reads and draft-writes pass
+through; the model sees the skill and pauses to show totals before
+sending anything. The hook is fail-closed: any Frihet MCP operation
+that the classifier does not recognise also escalates.
 
 ## Safety contract (summary)
 
