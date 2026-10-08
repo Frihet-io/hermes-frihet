@@ -142,40 +142,114 @@ def timeout_seconds() -> float:
 
 # Patterns are intentionally conservative. A substring of any of these in a
 # candidate string is sufficient to mask the entire token in place.
-# Order matters: more specific patterns first, generic last. The Bearer rule
-# runs before the generic Authorization rule so a "Bearer ..." payload keeps
-# its label (the generic rule would otherwise redact the whole header line,
-# hiding the fact that a Bearer token was present).
+# Order matters: more specific patterns first, generic last.
+#
+# Two rules target ``Authorization:`` lines — one for ``Bearer ...`` (which
+# preserves the ``Bearer`` label so a reader still knows the kind of
+# credential was present) and a generic fallback. The generic rule was
+# historically skipped whenever ANY prior rule in the document produced a
+# ``[REDACTED`` marker — that meant a document with multiple
+# ``Authorization:`` lines, only one of which had a Bearer token, left the
+# others unmasked. The new implementation applies rules PER LINE so the
+# generic fallback fires on lines that still carry an unmasked
+# ``Authorization: ...`` even when other lines were already masked.
+#
+# The generic rule also requires a ``:`` (or whitespace) separator after
+# ``Authorization``. Earlier versions accepted zero characters between the
+# header name and the value, which collided with unrelated strings
+# (``Authorization=bar;`` in HTTP headers lists, or ``Authorization;``
+# in some log formats). The separator requirement keeps the rule narrow.
 _REDACT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"fri_[A-Za-z0-9_\-]{8,}"), "[REDACTED:FRIHET_API_KEY]"),
     (re.compile(r"FRIHET_API_KEY\s*=\s*\S+"), "FRIHET_API_KEY=[REDACTED]"),
-    (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9_\-\.=]+"),
+    (re.compile(r"(?i)(authorization\s*:?\s*bearer\s+)[A-Za-z0-9_\-\.=]+"),
      r"\1[REDACTED:TOKEN]"),
     (re.compile(r"(?i)bearer\s+[A-Za-z0-9_\-\.=]{8,}"), "Bearer [REDACTED:TOKEN]"),
     (re.compile(r"(?i)(authorization\s*:\s*)[^\n\r]+"), r"\1[REDACTED]"),
 )
+# Mask for any other secret-shaped substring we did not name. Defence
+# in depth: catches mislabelled Bearer tokens (e.g. ``Token:`` or
+# ``Secret:``) before they reach the model context.
+_OTHER_SECRET_HINT = re.compile(
+    r"(?i)(token|secret|api[_\-]?key|password)\s*[:=]\s*"
+    r"[A-Za-z0-9_\-\.=]{8,}"
+)
+
+
+def _redact_one_segment(segment: str) -> str:
+    """Apply ``_REDACT_RULES`` to a single text segment (line or
+    non-newline substring). The per-segment scope means the
+    ``Authorization:`` generic fallback still fires on lines that
+    weren't previously masked, while leaving masked lines alone.
+
+    Rules apply in order; once any rule produces a ``[REDACTED`` marker
+    on the segment, subsequent generic rules must not overwrite that
+    marker. We track per-segment which segments have been masked by a
+    specific rule so the generic ``Authorization:`` rule only fires on
+    segments that did NOT already match the Bearer-specific rule.
+    """
+    if not segment:
+        return segment
+    out = segment
+    bear_specific_marker_present = False
+    for pattern, replacement in _REDACT_RULES:
+        is_generic_auth = (
+            "authorization" in pattern.pattern.lower()
+            and "bearer" not in pattern.pattern.lower()
+        )
+        # If a prior rule on THIS segment already produced a Bearer-
+        # specific redaction (which contains ``[REDACTED:TOKEN]``), the
+        # generic rule must not overwrite it. Otherwise we would lose
+        # the ``Bearer`` label that tells the reader what kind of
+        # credential was present.
+        if is_generic_auth and bear_specific_marker_present:
+            continue
+        prev = out
+        out = pattern.sub(replacement, out)
+        if out != prev and "[REDACTED:TOKEN]" in out:
+            bear_specific_marker_present = True
+    return out
 
 
 def redact(value: str) -> str:
     """Return ``value`` with any embedded Frihet secret material masked.
 
-    Used by the ``pre_tool_call`` hook so a misconfigured tool invocation
-    whose argument happened to contain a key never bubbles it up to the
-    model or the session transcript.
+    Used by every public function (status, doctor, hook payload builder,
+    probe error reporting) so a misconfigured tool invocation whose
+    argument happened to contain a key never bubbles it up to the model
+    or the session transcript.
+
+    Algorithm
+    ---------
+    We split on newlines first, then on runs of non-newline characters,
+    and apply ``_REDACT_RULES`` per segment. The per-segment scope is
+    critical: an earlier implementation skipped the generic
+    ``Authorization:`` rule as soon as ANY prior rule in the same
+    document produced a ``[REDACTED`` marker. That meant a document
+    with multiple ``Authorization:`` lines — say one ``Bearer`` and one
+    ``Basic`` — left the second un-redacted. Splitting per line means
+    the generic fallback fires only when the current line still has an
+    unmasked ``Authorization: ...`` substring.
+
+    We then apply the broader ``token|secret|api_key|password``
+    fallback regex across the joined result. This catches mislabelled
+    secrets (``Token:``, ``Secret:``) before they escape.
+
+    The function never raises — secret material in error reporting
+    must never break the call path.
     """
     if not value:
         return value
-    out = value
-    for pattern, replacement in _REDACT_RULES:
-        # Skip the generic ``Authorization: ...`` redactor if a more specific
-        # rule already produced a ``[REDACTED`` marker on this segment —
-        # otherwise the generic rule would clobber ``Bearer [REDACTED:TOKEN]``
-        # back into ``Authorization: [REDACTED]``, losing the token-kind label.
-        pat = pattern.pattern
-        is_generic_auth = "authorization" in pat.lower() and "bearer" not in pat.lower()
-        if is_generic_auth and "[REDACTED" in out:
-            continue
-        out = pattern.sub(replacement, out)
+    # Per-line masking keeps the generic Authorization rule firing on
+    # lines that weren't already masked by the specific Bearer rule.
+    lines = value.split("\n")
+    redacted_lines = [_redact_one_segment(line) for line in lines]
+    out = "\n".join(redacted_lines)
+    # Defence in depth: catch mislabelled secrets anywhere.
+    out = _OTHER_SECRET_HINT.sub(
+        lambda m: re.sub(r"[A-Za-z0-9_\-\.=]{8,}$", "[REDACTED]", m.group(0)),
+        out,
+    )
     return out
 
 

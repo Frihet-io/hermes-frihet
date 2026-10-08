@@ -106,12 +106,19 @@ def _make_command(ctx: Any):
         if extra:
             # Refuse extra positional arguments across every subcommand.
             # This is the single guardrail for "user pasted an API key in
-            # chat" — we reject it loudly instead of swallowing it.
+            # chat" — we reject it loudly without echoing anything back.
+            #
+            # **Privacy contract:** the response carries ``count`` (the
+            # number of unwanted positional arguments) but NEVER their
+            # contents. An earlier version put the raw tokens in
+            # ``unexpected_args`` and the slash-command response landed in
+            # the chat transcript — a classic credential-leak channel.
+            # We must not reproduce the user's input, even to flag it.
             result = {
                 "success": False,
                 "error": "unexpected_arguments",
                 "subcommand": action,
-                "unexpected_args": extra,
+                "unexpected_arg_count": len(extra),
                 "usage": "/frihet <status|setup|doctor>",
                 "hint": (
                     "This plugin never accepts credentials as slash-command "
@@ -152,11 +159,21 @@ def _make_command(ctx: Any):
                 },
             }
         else:
+            # Same privacy rule as the unexpected_arguments branch:
+            # we do NOT echo the user's input back, even when it's just
+            # a typo'd subcommand name. ``subcommand`` was previously
+            # echoed and could have contained an API key if the user
+            # pasted one in place of ``status``/``setup``/``doctor``.
             result = {
                 "success": False,
                 "error": "unknown_subcommand",
-                "subcommand": action,
                 "usage": "/frihet <status|setup|doctor>",
+                "hint": (
+                    "Allowed subcommands are status, setup, doctor. "
+                    "This plugin does not accept any positional argument "
+                    "after the subcommand; credentials belong in the "
+                    "host's secret directory, never in chat."
+                ),
             }
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
     return _command

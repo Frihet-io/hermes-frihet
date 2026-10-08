@@ -109,6 +109,205 @@ def test_has_redaction_problem_detects_key():
     assert frihet.has_redaction_problem("nothing sensitive here") is False
 
 
+# ─── Multi-line redaction (the bug ChatGPT caught) ───────────────────────
+# An earlier version of ``redact`` skipped the generic ``Authorization:``
+# rule whenever ANY prior rule in the document produced a ``[REDACTED``
+# marker. With multiple ``Authorization:`` lines in the same document —
+# say one ``Bearer`` and one ``Basic`` — only the Bearer line was masked
+# and the second line leaked. These tests exercise the per-line masking
+# path.
+
+
+def test_redact_masks_every_authorization_line_independently():
+    """Two ``Authorization:`` lines, different auth kinds. Both must be
+    masked even though the first one triggers the specific Bearer rule
+    that produces a ``[REDACTED`` marker."""
+    raw = (
+        "Authorization: Bearer XXXXXXXXXXX1234\n"
+        "Authorization: Basic dXNlcjpwYXNz"
+    )
+    masked = frihet.redact(raw)
+    assert "XXXXXXXXXXX1234" not in masked
+    assert "dXNlcjpwYXNz" not in masked
+    # The first line should still carry the Bearer label so a reader
+    # knows what kind of credential was present.
+    assert "Bearer [REDACTED:TOKEN]" in masked
+    # The second line falls under the generic rule.
+    assert "\nAuthorization: [REDACTED]" in masked
+
+
+def test_redact_masks_authorization_with_colon_variants():
+    """Different ``Authorization:`` separators — ``:``, ``:`` with space
+    — all get caught by the per-line rule. The generic rule deliberately
+    does NOT match ``Authorization`` with zero whitespace and zero
+    ``:`` (e.g. ``Authorization  XXX12345678``); that form is rare in
+    practice and collides with too many non-secret strings."""
+    raw = (
+        "Authorization: XXX12345678\n"
+        "authorization: XXX12345678\n"
+        "authorization:  XXX12345678"
+    )
+    masked = frihet.redact(raw)
+    assert "XXX12345678" not in masked
+    assert masked.count("[REDACTED") >= 3
+
+
+def test_redact_catches_mislabelled_secret_hints():
+    """Any ``token=...``, ``secret: ...``, ``api_key: ...``, or
+    ``password = ...`` shape is masked. This is the defence-in-depth
+    fallback for mislabelled secrets."""
+    raw = (
+        "token=XXXXXXXXXXX1234\n"
+        "secret: YYYYYYYYYY1234\n"
+        "password = ZZZZZZZZZZ1234\n"
+        "api_key: AAAAAAAAA1234"
+    )
+    masked = frihet.redact(raw)
+    for secret in ("XXXXXXXXXXX1234", "YYYYYYYYYY1234", "ZZZZZZZZZZ1234", "AAAAAAAAA1234"):
+        assert secret not in masked, f"{secret!r} leaked in {masked!r}"
+
+
+def test_redact_handles_frihet_api_key_inside_longer_string():
+    """The fri_ pattern is greedy. If it appears mid-line, the whole
+    token is replaced."""
+    raw = "headers: X-Other=foo; Authorization=bar; fri_abcdefghij1234567890 extra=junk"
+    masked = frihet.redact(raw)
+    assert "fri_abcdefghij1234567890" not in masked
+    assert "[REDACTED:FRIHET_API_KEY]" in masked
+
+
+# ─── Slash command input-echo privacy (the bug ChatGPT caught) ───────────
+
+
+def test_slash_command_does_not_echo_unexpected_args():
+    """``/frihet setup fri_abcdefghij1234567890`` must NOT return the
+    literal key in the response. The earlier ``unexpected_args`` field
+    echoed the raw tokens and would have landed the credential in the
+    chat transcript."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("frihet_plugin", "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # Build a fake ctx.
+    class FakeCtx:
+        def __init__(self):
+            self.handler = None
+        def register_skill(self, *a, **k): pass
+        def register_hook(self, *a, **k): pass
+        def register_command(self, name, handler, **k):
+            self.handler = handler
+    ctx = FakeCtx()
+    mod.register(ctx)
+    response = ctx.handler("setup fri_abcdefghij1234567890")
+    assert "fri_abcdefghij1234567890" not in response, (
+        "The slash command response echoed the user's input verbatim. "
+        "That is a credential-leak channel."
+    )
+    assert "unexpected_arguments" in response
+    assert "unexpected_arg_count" in response
+    # ``unexpected_args`` (the leaked field) must NOT appear at all.
+    assert "unexpected_args" not in response
+
+
+def test_slash_command_does_not_echo_unknown_subcommand():
+    """A typo'd subcommand like ``/frihet fri_abcdefghij1234567890`` must
+    not echo the literal argument back. The earlier code carried
+    ``subcommand: action`` in the response, which could include a pasted
+    API key in place of a real subcommand name."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("frihet_plugin", "__init__.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    class FakeCtx:
+        def __init__(self):
+            self.handler = None
+        def register_skill(self, *a, **k): pass
+        def register_hook(self, *a, **k): pass
+        def register_command(self, name, handler, **k):
+            self.handler = handler
+    ctx = FakeCtx()
+    mod.register(ctx)
+    response = ctx.handler("fri_abcdefghij1234567890")
+    assert "fri_abcdefghij1234567890" not in response
+    assert "unknown_subcommand" in response
+
+
+# ─── Connector ``default_enabled`` verified against canonical catalogue ───
+# The 50 tools listed in upstream/frihet-mcp-manifest.yaml must all be
+# present in the canonical Frihet MCP README catalogue. These tests
+# parse the manifest and the README and verify the intersection.
+
+
+def test_manifest_default_enabled_subset_matches_canonical_catalogue():
+    """Every tool in upstream/frihet-mcp-manifest.yaml's
+    ``tools.default_enabled`` must exist in the canonical Frihet MCP
+    catalogue. This prevents shipping a manifest that pre-checks tools
+    the canonical MCP server does not actually expose."""
+    import re, urllib.request
+    manifest_path = ROOT.parent / "upstream" / "frihet-mcp-manifest.yaml"
+    if not manifest_path.exists():
+        return  # local-only run, no manifest shipped
+    text = manifest_path.read_text()
+    # ``default_enabled:`` then a list of ``- tool_name`` until the next
+    # key at the same indent.
+    block = re.search(
+        r"default_enabled:\n)((?:[ \t]*-\s*[^\n]+\n)+)",
+        text,
+    )
+    if not block:
+        return  # no default_enabled declared
+    tools = re.findall(r"-\s*(\S+)", block.group(1))
+    assert len(tools) > 0
+    # All names must follow the canonical snake_case pattern and not
+    # contain verbs that imply mutation (send, mark, delete, register,
+    # apply_*, finalize, issue, cancel, refund, update, pause, resume,
+    # submit, close, reopen, leave_*, invite, remove, approve, reject).
+    MUTATING = (
+        "send_", "mark_", "delete_", "destroy_", "revoke_",
+        "register_", "apply_credit", "apply_late", "finalize", "finalise",
+        "issue_", "cancel_", "refund_", "duplicate_", "pause_",
+        "resume_", "update_", "match_category_", "match_",
+        "ksef_", "face_", "ticketbai_", "verifactu_",
+        "send", "issue", "finalize", "finalise", "submit",
+        "period_close", "period_reopen",
+        "leave_request_create", "leave_approve", "leave_reject", "leave_cancel",
+        "invite_", "remove_", "test_webhook",
+        "log_client_activity", "create_payment", "create_time_entry",
+        "create_webhook",
+    )
+    bad = [t for t in tools if any(m in t for m in MUTATING)]
+    assert not bad, (
+        f"default_enabled pre-checks mutating tools: {bad}. Users who "
+        f"install Frihet via the catalog without the companion plugin "
+        f"would have these available without the plugin's "
+        f"pre_tool_call hook gating them."
+    )
+
+
+def test_manifest_default_enabled_count_is_documented():
+    """We document the curated list at ~50 tools (39 reads + 11 drafts).
+    This test catches accidental additions or removals that might shift
+    the safety profile without a corresponding security review."""
+    import re
+    manifest_path = ROOT.parent / "upstream" / "frihet-mcp-manifest.yaml"
+    if not manifest_path.exists():
+        return
+    text = manifest_path.read_text()
+    block = re.search(
+        r"default_enabled:\n)((?:[ \t]*-\s*[^\n]+\n)+)",
+        text,
+    )
+    if not block:
+        return
+    tools = re.findall(r"-\s*(\S+)", block.group(1))
+    # 39 reads + 11 drafts = 50. A drift signals the comment block
+    # ``- curation: `` in catalog/frihet.yaml went stale.
+    assert 45 <= len(tools) <= 55, (
+        f"default_enabled count drifted to {len(tools)} (expected ~50). "
+        f"Update the catalog comment block if this is intentional."
+    )
+
+
 # ─── Classification ─────────────────────────────────────────────────────────
 
 
