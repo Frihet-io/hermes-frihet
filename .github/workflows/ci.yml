@@ -136,14 +136,27 @@ jobs:
           FRIHET_MCP_URL: ""
         run: python -m pytest tests/test_frihet.py -q
 
-  hermes-validate:
-    name: Hermes plugin manifest validate (CI gate)
+  manifest-validate:
+    name: Plugin manifest validate (schema + capability gate)
     runs-on: ubuntu-latest
-    # Load-bearing CI gate: runs on every push and every PR. Mirrors what
-    # ``hermes plugins validate`` does without requiring Hermes itself
-    # installed on the runner — the catalog maintainer runs the
-    # full admission test on a Hermes-enabled runner for the upstream PR.
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    # CI gate that runs on every push and every PR. This is a faithful
+    # subset of ``hermes plugins validate`` — it covers the parts that
+    # do not require a live Hermes runtime:
+    #
+    #   * plugin.yaml schema, list-typed fields, requires_hermes spec,
+    #     requires_env UPPER_SNAKE_CASE;
+    #   * the plugin module loads, ``_pre_tool_call`` exists, and the
+    #     safety table includes ``createPayment``;
+    #   * upstream/frihet-mcp-manifest.yaml shape (transport=http,
+    #     auth=oauth/oauth_pkce).
+    #
+    # **This job is NOT a replacement for ``hermes plugins validate``.**
+    # The full admission check — including the live loader, hook
+    # dispatcher, security-scan, and "No core override" checks — runs
+    # on a Hermes-enabled runner at PR time in
+    # NousResearch/hermes-agent. If you are about to tag a release,
+    # also run ``hermes plugins validate --install-deps .`` locally
+    # before pushing the tag. See plugin.yaml header for the policy.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -228,5 +241,28 @@ jobs:
               for line in fail:
                   print(f"FAIL: {line}", file=sys.stderr)
               sys.exit(1)
-          print(f"OK: hermes-validate passed (name={manifest['name']}, version={manifest['version']})")
+          print(f"OK: manifest-validate passed (name={manifest['name']}, version={manifest['version']})")
           PY
+  live-hermes-validate:
+    name: Live Hermes plugins validate (manual gate)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    # The full ``hermes plugins validate --install-deps .`` admission
+    # test. Marked ``workflow_dispatch`` because it requires the
+    # Hermes CLI to be installed on the runner; not every fork or
+    # contributor has that. Maintainers trigger it from the Actions
+    # tab before tagging a release. The schema-level
+    # ``manifest-validate`` job above is what runs on every PR.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run live hermes plugins validate
+        env:
+          FRIHET_API_KEY: ""
+        run: |
+          if ! command -v hermes >/dev/null 2>&1; then
+            echo "::error::hermes CLI not installed on this runner — this job is for maintainers with a Hermes-enabled runner."
+            exit 1
+          fi
+          hermes plugins validate --install-deps .
