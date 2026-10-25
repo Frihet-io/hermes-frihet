@@ -2,7 +2,7 @@
 
 This module follows the public ``PluginContext`` API documented in
 ``hermes_cli.plugins``. The plugin is deliberately thin: it does NOT
-re-implement the 158 Frihet MCP operations — the canonical surface stays
+re-implement the Frihet MCP operations — the canonical surface stays
 in ``@frihet/mcp-server`` (npm) and the remote endpoint
 ``https://mcp.frihet.io/mcp``.
 

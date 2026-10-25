@@ -2,7 +2,7 @@
 
 > **Official Hermes Agent integration for Frihet.**
 > Discoverability, setup, diagnostics, and operating guidance for the Frihet MCP.
-> **Zero duplicated tools** — the canonical Frihet surface (158 MCP operations)
+> **Zero duplicated tools** — the canonical Frihet MCP surface
 > stays in [`@frihet/mcp-server`](https://www.npmjs.com/package/@frihet/mcp-server)
 > and the remote endpoint [`https://mcp.frihet.io/mcp`](https://mcp.frihet.io/mcp).
 
@@ -19,7 +19,7 @@ Hermes Agent is an open-source agent framework by [Nous Research](https://nousre
 Frihet is an official business-management platform. This plugin is the
 **discoverability + operating layer** between them.
 
-The plugin does **not** re-implement any of the 158 Frihet MCP operations. It
+The plugin does **not** re-implement any of the Frihet MCP operations. It
 adds three things on top of the canonical MCP:
 
 1. **`/frihet` slash command** with three sub-actions: `status`, `setup`, `doctor`.

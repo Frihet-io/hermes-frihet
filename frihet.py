@@ -1,7 +1,7 @@
 """Frihet integration helpers for the Hermes Agent plugin.
 
 This module is intentionally small and stdlib-only. It does NOT register
-duplicate Frihet tools — the canonical Frihet surface (158 MCP operations)
+duplicate Frihet tools — the canonical Frihet MCP surface
 lives in the official ``@frihet/mcp-server`` and the remote endpoint at
 ``https://mcp.frihet.io/mcp``. What this module provides:
 
@@ -42,7 +42,7 @@ DEFAULT_MCP_URL = "https://mcp.frihet.io/mcp"
 DEFAULT_TIMEOUT_SECONDS = 10
 PROTOCOL_VERSION = "2025-06-18"  # MCP protocol version we speak.
 CLIENT_NAME = "hermes-frihet-plugin"
-CLIENT_VERSION = "0.2.0"
+CLIENT_VERSION = "0.2.1"
 
 # ─── Public env contract ────────────────────────────────────────────────────
 
@@ -310,6 +310,11 @@ DRAFT_FIRST_OPERATIONS: tuple[str, ...] = (
     "create_vendor",
 )
 
+# Read-only tools whose names do not start with a read verb. Exact names
+# only: each one is declared with ``READ_ONLY_ANNOTATIONS`` in
+# Frihet-io/frihet-mcp (``anomaly_list``: src/tools/hr.ts).
+READ_ONLY_TOOLS: frozenset[str] = frozenset({"anomaly_list"})
+
 
 # ─── Canonical Frihet safety contract (vendor source of truth) ─────────────
 # The Frihet MCP publishes its own authoritative safety contract at
@@ -442,7 +447,9 @@ def classify_tool_call(tool_name: str) -> dict[str, Any]:
     # the full ``mcp__server__op`` string, otherwise ``mcp__frihet__
     # list_invoices`` would fail the startswith check. ``bare`` is
     # already defined earlier in this function.
-    if bare.lower().startswith(("get", "list", "search", "describe", "schema", "fetch")):
+    if bare.lower() in READ_ONLY_TOOLS or bare.lower().startswith(
+        ("get", "list", "search", "describe", "schema", "fetch")
+    ):
         return {"kind": "read", "hint": "Read-only — safe to call."}
     return {
         "kind": "unknown",

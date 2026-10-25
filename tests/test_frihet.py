@@ -232,36 +232,22 @@ def test_slash_command_does_not_echo_unknown_subcommand():
     assert "unknown_subcommand" in response
 
 
-# ─── Connector ``default_enabled`` verified against canonical catalogue ───
-# The 50 tools listed in upstream/frihet-mcp-manifest.yaml must all be
-# present in the canonical Frihet MCP README catalogue. These tests
-# parse the manifest and the README and verify the intersection.
+# ─── Connector ``default_enabled`` safety profile ───────────────────────────
+# upstream/frihet-mcp-manifest.yaml pre-checks 39 tools for users who add
+# Frihet from the optional-mcps catalogue. They must all be reads: the
+# companion plugin's pre_tool_call hook is what gates writes, and a
+# catalogue-only install does not have it.
 
 
-def test_manifest_default_enabled_subset_matches_canonical_catalogue():
-    """Every tool in upstream/frihet-mcp-manifest.yaml's
-    ``tools.default_enabled`` must exist in the canonical Frihet MCP
-    catalogue. This prevents shipping a manifest that pre-checks tools
-    the canonical MCP server does not actually expose."""
-    import re, urllib.request
-    manifest_path = ROOT.parent / "upstream" / "frihet-mcp-manifest.yaml"
-    if not manifest_path.exists():
-        return  # local-only run, no manifest shipped
-    text = manifest_path.read_text()
-    # ``default_enabled:`` then a list of ``- tool_name`` until the next
-    # key at the same indent.
-    block = re.search(
-        r"default_enabled:\n)((?:[ \t]*-\s*[^\n]+\n)+)",
-        text,
-    )
-    if not block:
-        return  # no default_enabled declared
-    tools = re.findall(r"-\s*(\S+)", block.group(1))
-    assert len(tools) > 0
-    # All names must follow the canonical snake_case pattern and not
-    # contain verbs that imply mutation (send, mark, delete, register,
-    # apply_*, finalize, issue, cancel, refund, update, pause, resume,
-    # submit, close, reopen, leave_*, invite, remove, approve, reject).
+def _default_enabled_tools() -> list[str]:
+    import yaml
+    manifest = yaml.safe_load((ROOT / "upstream" / "frihet-mcp-manifest.yaml").read_text())
+    return manifest["tools"]["default_enabled"]
+
+
+def test_manifest_default_enabled_has_no_mutating_tools():
+    tools = _default_enabled_tools()
+    assert tools and len(tools) == len(set(tools)), "default_enabled is empty or has duplicates"
     MUTATING = (
         "send_", "mark_", "delete_", "destroy_", "revoke_",
         "register_", "apply_credit", "apply_late", "finalize", "finalise",
@@ -284,28 +270,18 @@ def test_manifest_default_enabled_subset_matches_canonical_catalogue():
     )
 
 
-def test_manifest_default_enabled_count_is_documented():
-    """We document the curated list at ~50 tools (39 reads + 11 drafts).
-    This test catches accidental additions or removals that might shift
-    the safety profile without a corresponding security review."""
-    import re
-    manifest_path = ROOT.parent / "upstream" / "frihet-mcp-manifest.yaml"
-    if not manifest_path.exists():
-        return
-    text = manifest_path.read_text()
-    block = re.search(
-        r"default_enabled:\n)((?:[ \t]*-\s*[^\n]+\n)+)",
-        text,
-    )
-    if not block:
-        return
-    tools = re.findall(r"-\s*(\S+)", block.group(1))
-    # 39 reads + 11 drafts = 50. A drift signals the comment block
-    # ``- curation: `` in catalog/frihet.yaml went stale.
-    assert 45 <= len(tools) <= 55, (
-        f"default_enabled count drifted to {len(tools)} (expected ~50). "
-        f"Update the catalog comment block if this is intentional."
-    )
+def test_manifest_default_enabled_tools_classify_as_read():
+    """Every pre-checked tool must classify as ``read``; anything else
+    makes the hook ask for approval on each call of a read-only tool."""
+    not_read = {t: k for t in _default_enabled_tools()
+                if (k := frihet.classify_tool_call(t)["kind"]) != "read"}
+    assert not not_read, f"default_enabled tools not classified as read: {not_read}"
+
+
+def test_manifest_default_enabled_count_is_pinned():
+    """Pinned so adding or removing a pre-checked tool is a visible,
+    reviewed change rather than a silent drift in the safety profile."""
+    assert len(_default_enabled_tools()) == 39
 
 
 # ─── Classification ─────────────────────────────────────────────────────────

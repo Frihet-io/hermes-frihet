@@ -1,7 +1,7 @@
 ---
 name: frihet
 description: "Use when operating Frihet through Hermes Agent — invoices, expenses, clients, quotes, products, webhooks, tax intelligence, or any other Frihet record. Always prefer reading before writing, drafts before sends, and reconciliation before retry."
-version: 0.2.0
+version: 0.2.1
 author: Frihet-io
 license: MIT
 metadata:
@@ -17,7 +17,7 @@ metadata:
 
 Frihet is the official business-management platform behind this integration.
 Hermes talks to Frihet through its canonical MCP surface (`@frihet/mcp-server`
-on npm, `https://mcp.frihet.io/mcp` remotely, 158 operations). This plugin
+on npm, `https://mcp.frihet.io/mcp` remotely). This plugin
 **does not** add or duplicate Frihet tools — the MCP provides them. What
 this plugin adds is:
 
@@ -114,7 +114,7 @@ the slash-command transcript is not a safe channel for secrets. Use
 
 ## What This Plugin Will Never Do
 
-- Re-implement any of the 158 Frihet MCP operations.
+- Re-implement any of the Frihet MCP operations.
 - Stand up a second MCP server alongside `@frihet/mcp-server`.
 - Reach into the host's internal config files, memory, or session state.
 - Auto-update its own files. Updates reach users only through the

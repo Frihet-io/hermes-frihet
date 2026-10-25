@@ -36,12 +36,12 @@ auth:
   # provider like Google. The MCP client triggers the browser flow on the
   # first probe / first connect.
 
-# Frihet's MCP exposes 158 canonical operations (drafts, sends, payments,
+# Frihet's MCP exposes well over a hundred canonical operations (drafts, sends, payments,
 # VeriFactu filings, etc.).
 #
 # Install-time tool selection — defensive defaults:
 #
-# The Frihet MCP is large (158 ops including send, mark_paid, delete,
+# The Frihet MCP is large (it includes send, mark_paid, delete,
 # VeriFactu). The connector does NOT depend on the optional plugin, so
 # we cannot rely on the plugin's pre_tool_call hook to gate mutating
 # operations when the connector is used standalone. We pre-prune here:
