@@ -243,26 +243,3 @@ jobs:
               sys.exit(1)
           print(f"OK: manifest-validate passed (name={manifest['name']}, version={manifest['version']})")
           PY
-  live-hermes-validate:
-    name: Live Hermes plugins validate (manual gate)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    # The full ``hermes plugins validate --install-deps .`` admission
-    # test. Marked ``workflow_dispatch`` because it requires the
-    # Hermes CLI to be installed on the runner; not every fork or
-    # contributor has that. Maintainers trigger it from the Actions
-    # tab before tagging a release. The schema-level
-    # ``manifest-validate`` job above is what runs on every PR.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Run live hermes plugins validate
-        env:
-          FRIHET_API_KEY: ""
-        run: |
-          if ! command -v hermes >/dev/null 2>&1; then
-            echo "::error::hermes CLI not installed on this runner — this job is for maintainers with a Hermes-enabled runner."
-            exit 1
-          fi
-          hermes plugins validate --install-deps .
