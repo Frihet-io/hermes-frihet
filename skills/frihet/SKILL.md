@@ -1,7 +1,7 @@
 ---
 name: frihet
 description: "Use when operating Frihet through Hermes Agent — invoices, expenses, clients, quotes, products, webhooks, tax intelligence, or any other Frihet record. Always prefer reading before writing, drafts before sends, and reconciliation before retry."
-version: 0.1.0
+version: 0.2.0
 author: Frihet-io
 license: MIT
 metadata:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-frihet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Hermes Agent plugin for Frihet — install, configure, diagnose, and operate the Frihet MCP from inside Hermes."
 readme = "README.md"
 requires-python = ">=3.11"
