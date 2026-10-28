@@ -94,12 +94,13 @@ The hook follows Hermes's `pre_tool_call` directive contract exactly
 anything else (e.g. `{review: True}`) is silently ignored — and a silent
 ignore on a fiscal action is the worst possible safety hole.
 
-## Connection Diagnostics
+## Connection Diagnostics & Daily Operational Brief
 
 ```
 /frihet status   # local snapshot, no network
-/frihet doctor   # live MCP handshake
+/frihet doctor   # live MCP handshake + native auth/tools check
 /frihet setup    # prints host-level auth guidance; does NOT accept credentials
+/frihet brief    # read-only Daily/Weekly Operational Business Brief
 ```
 
 `status` is always safe. `doctor` makes one `initialize` round-trip plus,
@@ -111,6 +112,24 @@ guidance surface; it does NOT accept credentials as arguments because
 the slash-command transcript is not a safe channel for secrets. Use
 `hermes mcp login frihet` (OAuth/PKCE) or `hermes auth add frihet`
 (unattended API key) instead.
+
+### Daily / Weekly Operational Business Brief (`/frihet brief`)
+
+When the user runs `/frihet brief` or asks *"¿Qué debería revisar hoy en mi negocio y por qué?"* (*"What should I review today in my business and why?"*), execute a **read-only** operational sweep via `ctx.call_mcp("frihet", ...)` across:
+- `get_business_context`
+- `list_invoices`
+- `list_quotes`
+- `list_expenses`
+- `list_clients`
+- `list_client_activities` (for priority clients with overdue or upcoming invoice maturities)
+
+Enforce these brief invariants (Canonical Monetary & Temporal Brief Contract, `Frihet-io/frihet-mcp#257`):
+1. **Absent != 0**: If a document lacks `total`, `amount`, and valid `items` (`{}`), resolve `amount: None`, `provenance: "unavailable"`, `unavailableCount: 1` (never `0.0 EUR`). Any bucket containing an `unavailable` document marks its aggregate `amount: None` and `provenance: "unavailable"`.
+2. **Multi-Currency Separation**: Never sum different currencies (`100 EUR` + `100 USD` -> `amount: None`, `currency: "MIXED"`, `provenance: "mixed_currency_unconverted"`, `totalsByCurrency: {"EUR": ..., "USD": ...}`).
+3. **Canonical Discounts & Taxes**: Derive `items[]` totals applying line-level `discount`, document-level `discountRate`, `taxRate`, `equivalenceSurchargeRate`, and `irpfRate` over the discounted tax-exclusive base, failing closed to `unavailable` on `pricesIncludeTax: true`, `compoundTaxes`, or `prepayment`.
+4. **Honest Unpaid Nominal Wording & Draft Separation**: Exclude `draft` invoices from issued receivables (`draftInvoicesExcluded`). Set `realOutstandingBalanceDeterminable: false`, `unpaidNominalSemantics: "nominal_unpaid_invoice_totals_without_partial_payments"`, and label unpaid issued invoices in Markdown as `Importe nominal de facturas no marcadas como pagadas (saldo pendiente real no determinable sin cobros parciales)`.
+5. **Explicit Temporal Scope & Coverage (`complete` vs `partial`)**: Report `coverage.temporalScope = "unfiltered_operational_sample_as_of_date"` alongside `currentMonthActivity` (`referenceMonth: periodMonth`) so the unfiltered operational sample as of `asOfDate` is never conflated with current-month issuance.
+6. **Non-Deductible Expense Hygiene & Human Approval Gate**: Flag `taxDeductible: false` as a valid operational state (never an API error), and require `humanApprovalRequired: true` (`mutatingToolExecuted: false`) on every suggested action.
 
 ## What This Plugin Will Never Do
 

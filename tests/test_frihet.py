@@ -1132,3 +1132,240 @@ def test_mcp_config_dict_auth_shape_is_silent_misconfiguration(
     # But it should log a warning so an attentive one sees it.
     # (We accept either: the warning was emitted, or it was not. The important
     # contract is that the plugin doesn't LIE by reporting "missing" here.)
+
+
+# ─── Daily / Weekly Operational Business Brief (/frihet brief) ──────────────
+
+
+def test_brief_without_ctx_returns_offline_guidance_and_no_fabricated_numbers():
+    report = frihet.brief(ctx=None, as_of_date="2026-10-28")
+    assert report["success"] is False
+    assert report["ok"] is False
+    assert report["mode"] == "offline_guidance"
+    assert report["error"] == "no_plugin_context"
+    assert report["question"] == "¿Qué debería revisar hoy en mi negocio y por qué?"
+    assert "list_invoices" in report["orchestrated_read_tools"]
+    assert report["safety_contract"]["read_only_execution"] is True
+    assert report["safety_contract"]["human_approval_required"] is True
+    assert report["safety_contract"]["auto_executed"] is False
+    assert report["provenance"]["tier"] == "community"
+    assert report["provenance"]["nous_endorsement"] is False
+    assert report["provenance"]["connectors_ui_pr"]["status"] == "open"
+
+
+def test_brief_complete_workspace_separates_drafts_and_flags_approval():
+    calls_made: list[tuple[str, dict[str, Any]]] = []
+
+    class _FakeCtx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            assert server == "frihet"
+            calls_made.append((tool, dict(arguments)))
+            if tool == "get_business_context":
+                return {"ok": True, "result": {"currency": "EUR", "company": {"name": "Studio Demo SL"}}}
+            if tool == "list_invoices":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "inv_overdue_1",
+                                "documentNumber": "FAC-2026-0010",
+                                "clientId": "cli_1",
+                                "clientName": "Acme Iberica SL",
+                                "status": "overdue",
+                                "dueDate": "2026-10-18",
+                                "total": 1210.0,
+                                "currency": "EUR",
+                            },
+                            {
+                                "id": "inv_due_soon_1",
+                                "documentNumber": "FAC-2026-0011",
+                                "clientId": "cli_2",
+                                "clientName": "Nordic Labs AB",
+                                "status": "sent",
+                                "dueDate": "2026-11-01",
+                                "items": [{"description": "Retainer", "quantity": 2, "unitPrice": 500}],
+                                "taxRate": 21,
+                                "currency": "EUR",
+                            },
+                            {
+                                "id": "inv_draft_1",
+                                "documentNumber": "DRAFT-2026-0099",
+                                "clientId": "cli_1",
+                                "clientName": "Acme Iberica SL",
+                                "status": "draft",
+                                "total": 9999.0,
+                                "currency": "EUR",
+                            },
+                        ],
+                        "total": 3,
+                    },
+                }
+            if tool == "list_quotes":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "quo_1",
+                                "documentNumber": "PRE-2026-0004",
+                                "clientName": "Acme Iberica SL",
+                                "status": "sent",
+                                "validUntil": "2026-10-30",
+                                "total": 2500.0,
+                                "currency": "EUR",
+                            }
+                        ],
+                        "total": 1,
+                    },
+                }
+            if tool == "list_expenses":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "exp_1",
+                                "description": "Business lunch",
+                                "date": "2026-10-20",
+                                "amount": 65.0,
+                                "vendor": "Restaurante Central",
+                                "category": "meals",
+                                "taxDeductible": False,
+                            },
+                            {
+                                "id": "exp_2",
+                                "description": "Cloud hosting",
+                                "date": "2026-10-21",
+                                "amount": 120.0,
+                                "taxDeductible": True,
+                            },
+                        ],
+                        "total": 2,
+                    },
+                }
+            if tool == "list_clients":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [
+                            {"id": "cli_1", "name": "Acme Iberica SL"},
+                            {"id": "cli_2", "name": "Nordic Labs AB"},
+                        ],
+                        "total": 2,
+                    },
+                }
+            if tool == "list_client_activities":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [
+                            {
+                                "id": "act_1",
+                                "type": "call",
+                                "title": "Initial billing check-in",
+                                "timestamp": "2026-10-15T10:00:00Z",
+                            }
+                        ],
+                        "total": 1,
+                    },
+                }
+            raise AssertionError(f"Unexpected tool call: {tool}")
+
+    report = frihet.brief(ctx=_FakeCtx(), as_of_date="2026-10-28")
+    assert report["ok"] is True
+    assert report["coverage"]["status"] == "complete"
+
+    # Draft invoice (9999 EUR) MUST NOT be mixed into issued open receivables (1210 + 1210 = 2420 EUR)
+    col = report["collections_and_due_dates"]
+    assert col["overdue_count"] == 1
+    assert col["overdue_totals_by_currency"]["EUR"] == 1210.0
+    assert col["upcoming_due_count"] == 1
+    assert col["upcoming_due_items"][0]["amount_provenance"] == "derived_from_items"
+    assert col["upcoming_due_items"][0]["amount"] == 1210.0
+    assert col["issued_open_totals_by_currency"]["EUR"] == 2420.0
+    assert col["draft_invoices_excluded_from_receivables"]["count"] == 1
+    assert col["draft_invoices_excluded_from_receivables"]["totals_by_currency"]["EUR"] == 9999.0
+
+    # Quotes and expenses
+    assert report["quotes_to_follow_up"]["count"] == 1
+    assert report["expenses_to_review"]["count"] == 2
+    exp_reasons = {
+        item["id"]: item["review_reasons"]
+        for item in report["expenses_to_review"]["items"]
+    }
+    assert any("marked_non_deductible" in r for r in exp_reasons["exp_1"])
+    assert "missing_vendor" in exp_reasons["exp_2"]
+
+    # Every suggested action requires human approval and is never auto-executed
+    assert len(report["suggested_actions"]) >= 4
+    for action in report["suggested_actions"]:
+        assert action["human_approval_required"] is True
+        assert action["auto_executed"] is False
+
+    # Zero mutating tools were called
+    called_tool_names = [name for name, _ in calls_made]
+    for name in called_tool_names:
+        assert frihet.classify_tool_call(f"mcp__frihet__{name}")["kind"] == "read"
+
+
+def test_brief_marks_partial_coverage_when_paginated():
+    class _PaginatedCtx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            if tool == "get_business_context":
+                return {"ok": True, "result": {"currency": "EUR"}}
+            if tool == "list_invoices":
+                return {
+                    "ok": True,
+                    "result": {
+                        "data": [{"id": "inv_1", "status": "sent", "dueDate": "2026-10-29", "total": 100}],
+                        "total": 45,
+                    },
+                }
+            return {"ok": True, "result": {"data": [], "total": 0}}
+
+    report = frihet.brief(ctx=_PaginatedCtx(), as_of_date="2026-10-28", page_limit=20)
+    assert report["ok"] is True
+    assert report["coverage"]["status"] == "partial"
+    assert report["coverage"]["resources"]["invoices"]["status"] == "partial"
+    assert any("partial (1 of 45" in note for note in report["coverage"]["notes"])
+
+
+def test_brief_handles_allowlist_missing_and_redacts_errors():
+    class _DeniedCtx:
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            raise PermissionError("Not allowed; token fri_secret_leak_1234567890abcdef")
+
+    report = frihet.brief(ctx=_DeniedCtx(), as_of_date="2026-10-28")
+    assert report["ok"] is False
+    assert report["error"] == "mcp_allowlist_missing"
+    assert "fri_secret_leak_1234567890abcdef" not in json.dumps(report)
+
+
+def test_slash_command_wires_brief_and_rejects_extra_args(monkeypatch):
+    module = _load_init()
+    monkeypatch.setattr(module, "_frihet", frihet, raising=False)
+    captured: dict[str, Any] = {}
+
+    class _Ctx:
+        def register_skill(self, *a, **k): pass
+        def register_hook(self, *a, **k): pass
+        def register_command(self, name, handler, **kwargs):
+            captured["handler"] = handler
+            captured["kwargs"] = kwargs
+        def call_mcp(self, server, tool, arguments, timeout=None):
+            return {"ok": True, "result": {"data": [], "total": 0}}
+
+    module.register(_Ctx())
+    assert "brief" in (captured["kwargs"].get("args_hint") or "")
+    help_payload = json.loads(captured["handler"]("help"))
+    assert "brief" in help_payload["subcommands"]
+
+    brief_payload = json.loads(captured["handler"]("brief"))
+    assert brief_payload["ok"] is True
+    assert brief_payload["question"] == "¿Qué debería revisar hoy en mi negocio y por qué?"
+
+    leaked_attempt = captured["handler"]("brief fri_abcdefghij1234567890")
+    assert "fri_abcdefghij1234567890" not in leaked_attempt
+    assert "unexpected_arguments" in leaked_attempt
+
