@@ -22,7 +22,7 @@ Frihet is an official business-management platform. This plugin is the
 The plugin does **not** re-implement any of the Frihet MCP operations. It
 adds three things on top of the canonical MCP:
 
-1. **`/frihet` slash command** with three sub-actions: `status`, `setup`, `doctor`.
+1. **`/frihet` slash command** with four sub-actions: `status`, `setup`, `doctor`, `brief`.
 2. **`pre_tool_call` hook** that flags Frihet writes whose names imply irreversibility
    (send, markPaid, registerVerifactu, delete, …) so downstream policy or the
    model can pause and require human confirmation.
@@ -107,6 +107,7 @@ In any Hermes chat session:
 /frihet status    # local snapshot — no network
 /frihet setup     # prints host-level auth guidance; does NOT accept credentials
 /frihet doctor    # live MCP handshake — reports four explicit states
+/frihet brief     # read-only Daily/Weekly Operational Business Brief
 ```
 
 `/frihet setup` no longer accepts a candidate API key. Passing one in chat
@@ -131,7 +132,23 @@ deliberately do NOT use `api_key_present` as a synonym for
 `mcp_configured_in_hermes`: an OAuth-first flow has no env var at all,
 so conflating the two would be a known false negative.
 
-Then ask Hermes:
+Then run `/frihet brief` or ask Hermes:
+
+```text
+¿Qué debería revisar hoy en mi negocio y por qué?
+```
+
+`/frihet brief` orchestrates read-only MCP calls (`get_business_context`,
+`list_invoices`, `list_quotes`, `list_expenses`, `list_clients`,
+`list_client_activities`) and returns a structured operational brief:
+- **Overdue & upcoming invoice maturities** (strictly separating issued fiscal receivables from unissued `draft` invoices)
+- **Expiring / expired sent quotes** needing commercial follow-up
+- **Expenses to review** (missing vendor/category or marked `taxDeductible: false`, treated as a valid state to confirm rather than an error)
+- **CRM follow-ups** for clients with open overdue exposure
+- **Prioritized suggested actions (`P1`/`P2`/`P3`)** with `human_approval_required: true` and `auto_executed: false`
+- **Explicit coverage (`complete` vs `partial`)** and `known_unknowns` (no bank treasury inferred without bank transaction reads)
+
+Or ask Hermes:
 
 ```
 show me my overdue invoices from the last 30 days
@@ -215,19 +232,17 @@ hermes plugins validate ~/.hermes/plugins/frihet --install-deps
   and a non-blocking smoke on 3.11/3.12/3.13.
 - **Frihet MCP protocol:** `2025-06-18` (forward-compatible with later minor).
 
-## Upstream MCP catalog candidate
+## Catalog status & upstream Connectors candidate
 
-In addition to this plugin, the repo carries a ready-to-submit candidate for
-Hermes's native `optional-mcps/` directory:
+Two separate upstream surfaces exist in `NousResearch/hermes-agent` and must not be conflated:
 
-- `upstream/frihet-mcp-manifest.yaml` — modelled on
-  `optional-mcps/linear/manifest.yaml`, declares native MCP OAuth 2.1 + PKCE,
-  no third-party provider, post-install guidance.
-
-When we're ready to publish (after dogfooding the plugin), the upstream PR
-lands this manifest at `NousResearch/hermes-agent/optional-mcps/frihet/`,
-so Frihet shows up under **Capabilities → Connectors** in addition to
-**Capabilities → Plugins**.
+1. **Hermes Plugin Catalog (`tier: community`, maintained by Frihet — merged):**
+   - `catalog/frihet.yaml` is merged in `NousResearch/hermes-agent#135038` and updated to `v0.2.1` in `NousResearch/hermes-agent#144210`.
+   - Installable today via `hermes plugins install frihet`.
+   - Community-tier integration maintained by Frihet (`trust: untrusted` default for third-party MCPs); listing in the community catalog does not imply endorsement by Nous Research.
+2. **Hermes Connectors UI / `optional-mcps` (`NousResearch/hermes-agent#134790` — open):**
+   - `upstream/frihet-mcp-manifest.yaml` — modelled on `optional-mcps/linear/manifest.yaml`, declares native MCP OAuth 2.1 + PKCE, no third-party provider, and 39 read-only `default_enabled` tools.
+   - Upstream PR `NousResearch/hermes-agent#134790` (landing at `optional-mcps/frihet/manifest.yaml` for **Capabilities → Connectors**) remains **open** pending upstream review.
 
 ## License
 

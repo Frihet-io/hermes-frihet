@@ -11,10 +11,12 @@ What the plugin adds on top of the MCP itself:
 * A skill (``skills/frihet/SKILL.md``) that teaches Hermes the Frihet
   operating contract (read-before-write, draft-first, Idempotency-Key,
   redaction, Frihet-server authority for workspace/scopes/roles).
-* A slash command ``/frihet`` with three sub-actions:
+* A slash command ``/frihet`` with four sub-actions:
     - ``status`` — local snapshot (no network).
-    - ``setup``  — guided validation of a candidate ``FRIHET_API_KEY``.
-    - ``doctor`` — live MCP handshake.
+    - ``setup``  — guided authentication instructions (no credentials accepted).
+    - ``doctor`` — live MCP handshake + native auth/tools verification.
+    - ``brief``  — read-only Daily/Weekly Operational Business Brief answering
+      *"¿Qué debería revisar hoy en mi negocio y por qué?"*.
 * A ``pre_tool_call`` hook that flags Frihet operations whose names imply
   irreversibility, so downstream policy or the model itself can pause and
   request human confirmation.
@@ -87,7 +89,7 @@ def _make_command(ctx: Any):
     and reconnect) — the plugin itself never reads tokens.
     """
     def _command(raw_args: str) -> str:
-        """Slash-command handler for ``/frihet <status|setup|doctor>``.
+        """Slash-command handler for ``/frihet <status|setup|doctor|brief>``.
 
         ``/frihet setup`` no longer accepts an inline key argument. Passing
         a key in chat would leave it in the transcript and in any host log
@@ -119,7 +121,7 @@ def _make_command(ctx: Any):
                 "error": "unexpected_arguments",
                 "subcommand": action,
                 "unexpected_arg_count": len(extra),
-                "usage": "/frihet <status|setup|doctor>",
+                "usage": "/frihet <status|setup|doctor|brief>",
                 "hint": (
                     "This plugin never accepts credentials as slash-command "
                     "arguments — they would land in the chat transcript. "
@@ -137,10 +139,13 @@ def _make_command(ctx: Any):
             # authenticated="unknown" / tools_available="unknown" and
             # tells the user to run from inside Hermes.
             result = _frihet.doctor(ctx=ctx)
+        elif action == "brief":
+            # Read-only Daily/Weekly Operational Business Brief via ctx.call_mcp.
+            result = _frihet.brief(ctx=ctx)
         elif action in {"help", "--help", "-h"}:
             result = {
                 "success": True,
-                "usage": "/frihet <status|setup|doctor>",
+                "usage": "/frihet <status|setup|doctor|brief>",
                 "subcommands": {
                     "status": "Show local plugin config (no network).",
                     "setup": (
@@ -156,6 +161,13 @@ def _make_command(ctx: Any):
                         "evidence comes from Hermes's native MCP client, "
                         "never from the plugin reading tokens."
                     ),
+                    "brief": (
+                        "Read-only Daily/Weekly Operational Business Brief — "
+                        "answers '¿Qué debería revisar hoy en mi negocio y por qué?' "
+                        "covering due dates, pending collections, expiring quotes, "
+                        "expenses to review, CRM follow-ups, and human-approved "
+                        "suggested actions."
+                    ),
                 },
             }
         else:
@@ -167,15 +179,15 @@ def _make_command(ctx: Any):
             result = {
                 "success": False,
                 "error": "unknown_subcommand",
-                "usage": "/frihet <status|setup|doctor>",
+                "usage": "/frihet <status|setup|doctor|brief>",
                 "hint": (
-                    "Allowed subcommands are status, setup, doctor. "
+                    "Allowed subcommands are status, setup, doctor, brief. "
                     "This plugin does not accept any positional argument "
                     "after the subcommand; credentials belong in the "
                     "host's secret directory, never in chat."
                 ),
             }
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+        return _frihet.redact(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     return _command
 
 
@@ -196,11 +208,11 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", _pre_tool_call)
 
     # ── Slash command: /frihet ─────────────────────────────────────────────
-    # Bind ctx via closure so the doctor subcommand can authoritatively
-    # verify authentication through ``ctx.call_mcp``.
+    # Bind ctx via closure so the doctor and brief subcommands can
+    # authoritatively invoke ``ctx.call_mcp``.
     ctx.register_command(
         "frihet",
         _make_command(ctx),
-        description="Frihet integration: status, setup, doctor.",
-        args_hint="<status|setup|doctor>",
+        description="Frihet integration: status, setup, doctor, brief.",
+        args_hint="<status|setup|doctor|brief>",
     )
