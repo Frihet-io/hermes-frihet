@@ -46,7 +46,7 @@ DEFAULT_MCP_URL = "https://mcp.frihet.io/mcp"
 DEFAULT_TIMEOUT_SECONDS = 10
 PROTOCOL_VERSION = "2025-06-18"  # MCP protocol version we speak.
 CLIENT_NAME = "hermes-frihet-plugin"
-CLIENT_VERSION = "0.2.1"
+CLIENT_VERSION = "0.2.2"
 
 # ─── Public env contract ────────────────────────────────────────────────────
 
